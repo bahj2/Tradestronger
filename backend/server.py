@@ -188,6 +188,15 @@ class IndicatorSnapshot(BaseModel):
     bb_lower: Optional[float]
     price: float
 
+class AIVote(BaseModel):
+    model: str  # human label e.g. "Claude Sonnet 4.5"
+    model_id: str  # short id e.g. "claude" / "gpt5"
+    action: str  # BUY / SELL / HOLD
+    confidence: int
+    summary: str
+    available: bool = True
+
+
 class AISignal(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     action: str  # BUY / SELL / HOLD
@@ -215,6 +224,10 @@ class AISignal(BaseModel):
     dxy_price: Optional[float] = None
     dxy_change_pct: Optional[float] = None
     analysis_steps: Optional[Dict[str, str]] = None
+    # Ensemble fields
+    consensus: Optional[str] = None  # DOUBLE_CONFIRMED / MAJORITY / CONFLICTED / SINGLE_SOURCE
+    votes: Optional[List[AIVote]] = None
+    news_sources: Optional[List[Dict[str, str]]] = None  # headlines used in analysis
 
 # ------------------- Routes -------------------
 @api_router.get("/")
@@ -348,11 +361,12 @@ async def _safe_dxy() -> Optional[Dict[str, float]]:
         return None
 
 async def _safe_news_titles(limit: int = 8) -> List[str]:
-    try:
-        result = await get_news(limit=limit)
-        return [item.get('title', '') for item in result.get('items', []) if item.get('title')]
-    except Exception:
-        return []
+    items = await _fetch_all_news()
+    return [item.get('title', '') for item in items[:limit] if item.get('title')]
+
+async def _safe_news_items(limit: int = 12) -> List[dict]:
+    items = await _fetch_all_news()
+    return items[:limit]
 
 def _trend_label(snap: Optional[IndicatorSnapshot]) -> str:
     if not snap or snap.ema20 is None or snap.ema50 is None:
@@ -483,6 +497,97 @@ def _compute_signal_strength_fallback(confidence: int) -> str:
         return "MODERATE"
     return "WEAK"
 
+
+async def _run_single_ai(provider: str, model: str, prompt: str, label: str) -> Optional[dict]:
+    """Call one LLM, parse its JSON reply. Returns None on failure."""
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"xauusd-{label}-{uuid.uuid4()}",
+            system_message="You are a precise FX/commodities analyst. Respond with strict JSON only.",
+        ).with_model(provider, model)
+        text = await chat.send_message(UserMessage(text=prompt))
+    except Exception as e:
+        logging.warning(f"AI {label} call failed: {e}")
+        return None
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _compute_consensus(claude_parsed: Optional[dict], gpt_parsed: Optional[dict]) -> tuple[str, dict, List[AIVote]]:
+    """Return (consensus_label, chosen_signal_dict, votes_list)."""
+    votes: List[AIVote] = []
+    if claude_parsed:
+        votes.append(AIVote(
+            model="Claude Sonnet 4.5",
+            model_id="claude",
+            action=str(claude_parsed.get('action', 'HOLD')).upper(),
+            confidence=int(claude_parsed.get('confidence', 50)),
+            summary=str(claude_parsed.get('summary', '')),
+            available=True,
+        ))
+    else:
+        votes.append(AIVote(
+            model="Claude Sonnet 4.5", model_id="claude",
+            action="N/A", confidence=0, summary="(unavailable)", available=False,
+        ))
+    if gpt_parsed:
+        votes.append(AIVote(
+            model="Gemini 3.1 Pro",
+            model_id="gemini",
+            action=str(gpt_parsed.get('action', 'HOLD')).upper(),
+            confidence=int(gpt_parsed.get('confidence', 50)),
+            summary=str(gpt_parsed.get('summary', '')),
+            available=True,
+        ))
+    else:
+        votes.append(AIVote(
+            model="Gemini 3.1 Pro", model_id="gemini",
+            action="N/A", confidence=0, summary="(unavailable)", available=False,
+        ))
+
+    available = [v for v in votes if v.available]
+    if not available:
+        return "FAILED", {}, votes
+
+    if len(available) == 1:
+        chosen = claude_parsed or gpt_parsed
+        return "SINGLE_SOURCE", chosen, votes
+
+    # Both available
+    if available[0].action == available[1].action and available[0].action != "HOLD":
+        # Both agree on a directional call
+        # Use Claude's signal (deeper reasoning) but boost confidence
+        chosen = dict(claude_parsed)
+        boosted = min(95, int((available[0].confidence + available[1].confidence) / 2) + 8)
+        chosen['confidence'] = boosted
+        return "DOUBLE_CONFIRMED", chosen, votes
+
+    if available[0].action == available[1].action and available[0].action == "HOLD":
+        # Both say HOLD - safe consensus
+        return "DOUBLE_CONFIRMED", claude_parsed, votes
+
+    # Disagreement: prefer the one with higher confidence, downgrade confidence
+    if available[0].confidence >= available[1].confidence:
+        chosen = dict(claude_parsed)
+    else:
+        chosen = dict(gpt_parsed)
+    chosen['confidence'] = max(20, int(chosen.get('confidence', 50) * 0.6))
+    chosen['action'] = "HOLD"  # safest when AIs disagree
+    return "CONFLICTED", chosen, votes
+
+
 @api_router.get("/analysis/ai", response_model=AISignal)
 async def get_ai_signal(interval: str = Query("1h")):
     if not EMERGENT_LLM_KEY:
@@ -497,7 +602,7 @@ async def get_ai_signal(interval: str = Query("1h")):
     candles_resp = await get_candles(interval=interval, size=120)
 
     # Multi-TF context (best-effort)
-    higher_tf, _ = (TIMEFRAME_HIERARCHY.get(interval, ("4h", "1day"))[0], None)
+    higher_tf = TIMEFRAME_HIERARCHY.get(interval, ("4h", "1day"))[0]
     lower_tf_map = {
         "1min": "1min", "5min": "1min", "15min": "5min",
         "1h": "15min", "4h": "1h", "1day": "4h",
@@ -508,7 +613,8 @@ async def get_ai_signal(interval: str = Query("1h")):
 
     # Macro & news context
     dxy = await _safe_dxy()
-    news_titles = await _safe_news_titles(limit=8)
+    news_titles = await _safe_news_titles(limit=10)
+    news_items = await _safe_news_items(limit=8)
 
     prompt = _build_strong_prompt(
         snapshot=snapshot,
@@ -522,31 +628,14 @@ async def get_ai_signal(interval: str = Query("1h")):
         news_titles=news_titles,
     )
 
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"xauusd-{uuid.uuid4()}",
-        system_message="You are a precise, professional FX/commodities analyst. Always respond with strict JSON only.",
-    ).with_model("anthropic", "claude-sonnet-4-5-20250929")
+    # Run Claude + Gemini in PARALLEL
+    claude_task = _run_single_ai("anthropic", "claude-sonnet-4-5-20250929", prompt, "claude")
+    gpt_task = _run_single_ai("gemini", "gemini-3.1-pro-preview", prompt, "gemini")
+    claude_parsed, gpt_parsed = await asyncio.gather(claude_task, gpt_task)
 
-    try:
-        response_text = await chat.send_message(UserMessage(text=prompt))
-    except Exception as e:
-        logging.exception("LLM call failed")
-        raise HTTPException(status_code=502, detail=f"AI analysis failed: {str(e)[:200]}")
-
-    text = response_text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    start = text.find('{')
-    end = text.rfind('}')
-    if start == -1 or end == -1:
-        raise HTTPException(status_code=502, detail="AI did not return JSON")
-    try:
-        parsed = json.loads(text[start:end + 1])
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"AI JSON parse error: {e}")
+    consensus, parsed, votes = _compute_consensus(claude_parsed, gpt_parsed)
+    if consensus == "FAILED" or not parsed:
+        raise HTTPException(status_code=502, detail="Both AI models failed to respond")
 
     def _opt_float(key):
         v = parsed.get(key)
@@ -612,6 +701,9 @@ async def get_ai_signal(interval: str = Query("1h")):
         dxy_price=dxy['price'] if dxy else None,
         dxy_change_pct=dxy['percent_change'] if dxy else None,
         analysis_steps=analysis_steps,
+        consensus=consensus,
+        votes=votes,
+        news_sources=[{'title': i.get('title', ''), 'source': i.get('source', ''), 'link': i.get('link', '')} for i in news_items],
     )
 
     # Persist
@@ -627,29 +719,61 @@ async def signal_history(limit: int = Query(20, le=100)):
 
 @api_router.get("/news")
 async def get_news(limit: int = Query(12, le=30)):
-    cached = _cache_get('news', ttl_seconds=600)
-    if cached:
-        return cached
-    url = "https://news.google.com/rss/search?q=gold+price+XAUUSD+OR+%22gold+market%22&hl=en-US&gl=US&ceid=US:en"
+    items = await _fetch_all_news()
+    return {"items": items[:limit]}
+
+# ------------------- News aggregation (multi-source) -------------------
+NEWS_QUERIES = [
+    ("Gold Market", "gold+price+XAUUSD+OR+%22gold+market%22"),
+    ("Fed / FOMC", "federal+reserve+OR+FOMC+rate+gold"),
+    ("Central Banks", "central+bank+gold+buying+OR+reserves+PBoC+OR+RBI"),
+    ("Macro / DXY", "US+dollar+DXY+inflation+OR+CPI+gold+impact"),
+    ("Geopolitics", "geopolitical+OR+sanctions+OR+conflict+gold+safe-haven"),
+]
+
+async def _fetch_news_url(url: str, source_label: str, timeout: float = 8.0) -> List[dict]:
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers={'User-Agent': 'Mozilla/5.0'}) as http:
+        async with httpx.AsyncClient(timeout=timeout, headers={'User-Agent': 'Mozilla/5.0'}) as http:
             r = await http.get(url)
             r.raise_for_status()
             feed = feedparser.parse(r.text)
     except Exception as e:
-        logging.warning(f"News fetch failed: {e}")
-        return {"items": []}
+        logging.warning(f"News fetch failed for {source_label}: {e}")
+        return []
     items = []
-    for entry in feed.entries[:limit]:
+    for entry in feed.entries[:6]:
         items.append({
             'title': entry.get('title', ''),
             'link': entry.get('link', ''),
             'published': entry.get('published', ''),
-            'source': entry.get('source', {}).get('title', '') if hasattr(entry, 'source') else '',
+            'source': source_label,
         })
-    result = {"items": items}
-    _cache_set('news', result)
-    return result
+    return items
+
+async def _fetch_all_news() -> List[dict]:
+    cached = _cache_get('all_news', ttl_seconds=600)
+    if cached:
+        return cached
+    tasks = [
+        _fetch_news_url(
+            f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en",
+            label,
+        )
+        for label, q in NEWS_QUERIES
+    ]
+    batches = await asyncio.gather(*tasks, return_exceptions=True)
+    all_items: List[dict] = []
+    seen = set()
+    for b in batches:
+        if isinstance(b, Exception) or not b:
+            continue
+        for item in b:
+            t = (item.get('title') or '').strip().lower()
+            if t and t not in seen:
+                seen.add(t)
+                all_items.append(item)
+    _cache_set('all_news', all_items)
+    return all_items
 
 # Mount router
 app.include_router(api_router)

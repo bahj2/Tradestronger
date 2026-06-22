@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
     TrendingUp, TrendingDown, Minus, Sparkles, RefreshCw, Loader2,
     Clock, Shield, Newspaper, DollarSign, Layers, Activity,
+    CheckCircle2, AlertTriangle, XCircle, Bot,
 } from "lucide-react";
 
 function fmt(n, d = 2) {
@@ -34,6 +35,15 @@ const strengthStyle = {
     MODERATE: { label: "MODERATE", color: "#D4AF37", bg: "rgba(212,175,55,0.15)" },
     WEAK: { label: "WEAK", color: "#FF2A55", bg: "rgba(255,42,85,0.15)" },
 };
+
+const consensusStyle = {
+    DOUBLE_CONFIRMED: { label: "DOUBLE CONFIRMED", color: "#00B86B", bg: "rgba(0,184,107,0.15)", Icon: CheckCircle2 },
+    SINGLE_SOURCE: { label: "SINGLE SOURCE", color: "#D4AF37", bg: "rgba(212,175,55,0.12)", Icon: AlertTriangle },
+    CONFLICTED: { label: "CONFLICTED", color: "#FF2A55", bg: "rgba(255,42,85,0.12)", Icon: XCircle },
+};
+
+const voteActionColor = (a) =>
+    a === "BUY" ? "#00B86B" : a === "SELL" ? "#FF2A55" : a === "N/A" ? "#737373" : "#D4AF37";
 
 const sentimentColor = (s) =>
     s === "BULLISH" ? "#00B86B" : s === "BEARISH" ? "#FF2A55" : "#A3A3A3";
@@ -89,8 +99,12 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, con
     ].filter((x) => x.v != null) : [];
 
     const strength = signal?.signal_strength ? strengthStyle[signal.signal_strength] : null;
+    const consensus = signal?.consensus ? consensusStyle[signal.consensus] : null;
+    const ConsensusIcon = consensus?.Icon;
     const belowThreshold = signal && signal.confidence < confidenceThreshold;
     const steps = signal?.analysis_steps;
+    const votes = signal?.votes || [];
+    const newsSources = signal?.news_sources || [];
 
     return (
         <div
@@ -102,7 +116,7 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, con
                 <div className="flex items-center gap-2">
                     <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
                     <span className="text-[10px] font-mono text-[#D4AF37] uppercase tracking-[0.2em]">
-                        Deep AI Signal · Claude 4.5
+                        Dual-AI Signal · Claude + Gemini
                     </span>
                 </div>
                 <button
@@ -125,10 +139,10 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, con
                 <div className="p-6 text-center">
                     <Loader2 className="w-6 h-6 mx-auto animate-spin text-[#D4AF37]" />
                     <p className="mt-3 text-xs font-mono text-gray-500 uppercase tracking-[0.2em]">
-                        Running deep analysis…
+                        Dual-AI analysis running…
                     </p>
                     <p className="mt-1 text-[10px] font-mono text-gray-600 tracking-[0.15em]">
-                        Trend · Momentum · News · Macro
+                        Claude · Gemini · cross-checking
                     </p>
                 </div>
             )}
@@ -195,6 +209,58 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, con
                             </div>
                         )}
                     </div>
+
+                    {/* AI Consensus Panel */}
+                    {(consensus || votes.length > 0) && (
+                        <div
+                            className="border rounded-sm p-3 space-y-2"
+                            style={{
+                                borderColor: consensus ? `${consensus.color}55` : "#262626",
+                                background: consensus ? consensus.bg : "#0F0F0F",
+                            }}
+                            data-testid="ai-consensus-panel"
+                        >
+                            <div className="flex items-center justify-between">
+                                <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-gray-500 flex items-center gap-1.5">
+                                    <Bot className="w-3 h-3" /> AI Ensemble Consensus
+                                </div>
+                                {consensus && ConsensusIcon && (
+                                    <div
+                                        className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.15em] font-bold"
+                                        style={{ color: consensus.color }}
+                                        data-testid="consensus-badge"
+                                    >
+                                        <ConsensusIcon className="w-3.5 h-3.5" />
+                                        {consensus.label}
+                                    </div>
+                                )}
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                                {votes.map((v) => (
+                                    <div
+                                        key={v.model_id}
+                                        className={`p-2 rounded-sm border ${v.available ? "border-[#262626] bg-[#0A0A0A]" : "border-[#1A1A1A] bg-[#0A0A0A] opacity-50"}`}
+                                        data-testid={`vote-${v.model_id}`}
+                                    >
+                                        <div className="text-[9px] font-mono text-gray-500 uppercase tracking-[0.1em] truncate">
+                                            {v.model}
+                                        </div>
+                                        <div className="flex items-baseline gap-2 mt-1">
+                                            <span
+                                                className="font-mono font-bold text-sm"
+                                                style={{ color: voteActionColor(v.action) }}
+                                            >
+                                                {v.action}
+                                            </span>
+                                            {v.available && (
+                                                <span className="font-mono text-xs text-gray-300">{v.confidence}%</span>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
 
                     {/* Entry & SL */}
                     <div className="grid grid-cols-2 gap-2">
@@ -297,6 +363,32 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, con
                             <div className="text-[10px] font-mono text-gray-500 uppercase tracking-[0.2em] mb-1">Reasoning</div>
                             <div className="text-xs text-gray-300 leading-relaxed" data-testid="ai-reasoning">
                                 {signal.reasoning}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* News sources fed into analysis */}
+                    {newsSources.length > 0 && (
+                        <div className="border-t border-[#262626] pt-3" data-testid="news-sources-panel">
+                            <div className="text-[10px] font-mono text-[#D4AF37] uppercase tracking-[0.2em] mb-2 flex items-center gap-1.5">
+                                <Newspaper className="w-3 h-3" /> World-Trade Intel ({newsSources.length} sources)
+                            </div>
+                            <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                                {newsSources.slice(0, 8).map((n, i) => (
+                                    <a
+                                        key={i}
+                                        href={n.link}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="block text-xs text-gray-300 hover:text-[#D4AF37] leading-snug transition-colors"
+                                        data-testid={`source-item-${i}`}
+                                    >
+                                        <span className="text-[9px] font-mono text-gray-600 uppercase tracking-[0.1em] mr-1">
+                                            [{n.source || "news"}]
+                                        </span>
+                                        {n.title}
+                                    </a>
+                                ))}
                             </div>
                         </div>
                     )}
