@@ -621,6 +621,23 @@ def _compute_signal_strength_fallback(confidence: int) -> str:
     return "WEAK"
 
 
+def _compute_atr(candles: List[dict], period: int = 14) -> float:
+    """Average True Range — measures real recent volatility."""
+    if len(candles) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, period + 1):
+        c = candles[-i]
+        prev = candles[-i - 1]
+        tr = max(
+            c['high'] - c['low'],
+            abs(c['high'] - prev['close']),
+            abs(c['low'] - prev['close']),
+        )
+        trs.append(tr)
+    return sum(trs) / period if trs else 0.0
+
+
 def _rule_engine_analyze(
     snapshot: IndicatorSnapshot,
     interval: str,
@@ -628,6 +645,7 @@ def _rule_engine_analyze(
     lower_snap: Optional[IndicatorSnapshot],
     dxy: Optional[Dict[str, float]],
     news_titles: List[str],
+    candles: Optional[List[dict]] = None,
 ) -> dict:
     """Deterministic rule-based analysis. Free, fast, no API calls.
     Outputs same JSON shape as the LLM analyzers."""
@@ -732,12 +750,23 @@ def _rule_engine_analyze(
     else:
         strength = "WEAK"
 
-    # SL/TP based on timeframe volatility
-    sl_pct = {
-        "1min": 0.005, "5min": 0.008, "15min": 0.012,
-        "1h": 0.018, "4h": 0.028, "1day": 0.045,
-    }.get(interval, 0.018)
-    sl_dist = snapshot.price * sl_pct
+    # SL/TP based on REAL volatility (ATR) — falls back to % if not enough candles
+    atr_val = _compute_atr(candles or [], period=14)
+    if atr_val > 0:
+        # ATR multipliers tuned per timeframe (tighter for fast TFs, wider for slow)
+        atr_mult = {
+            "1min": 1.0, "5min": 1.2, "15min": 1.4,
+            "1h": 1.6, "4h": 1.8, "1day": 2.0,
+        }.get(interval, 1.5)
+        sl_dist = atr_val * atr_mult
+        sl_method = f"ATR({atr_val:.2f}) × {atr_mult}"
+    else:
+        sl_pct = {
+            "1min": 0.005, "5min": 0.008, "15min": 0.012,
+            "1h": 0.018, "4h": 0.028, "1day": 0.045,
+        }.get(interval, 0.018)
+        sl_dist = snapshot.price * sl_pct
+        sl_method = f"{sl_pct*100:.1f}% of price"
 
     if action == "BUY":
         entry = snapshot.price
@@ -925,7 +954,10 @@ async def get_ai_signal(
 
     # ===== Branch on engine =====
     if engine == "rule":
-        parsed = _rule_engine_analyze(snapshot, interval, higher_snap, lower_snap, dxy, news_titles)
+        parsed = _rule_engine_analyze(
+            snapshot, interval, higher_snap, lower_snap, dxy, news_titles,
+            candles=candles_resp.get('candles'),
+        )
         votes = [AIVote(
             model="AURUM Rule Engine",
             model_id="rule",
