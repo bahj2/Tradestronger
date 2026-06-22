@@ -16,7 +16,7 @@ export default function TelegramSettings() {
     const [botToken, setBotToken] = useState("");
     const [chatId, setChatId] = useState("");
     const [enabled, setEnabled] = useState(false);
-    const [strongOnly, setStrongOnly] = useState(true);
+    const [alertMode, setAlertMode] = useState("strong");
     const [saving, setSaving] = useState(false);
     const [testing, setTesting] = useState(false);
 
@@ -26,18 +26,18 @@ export default function TelegramSettings() {
             setConfig(cfg);
             setChatId(cfg.chat_id || "");
             setEnabled(cfg.enabled || false);
-            setStrongOnly(cfg.strong_only ?? true);
+            setAlertMode(cfg.alert_mode || "strong");
         }).catch(() => {});
     }, [open]);
 
     const handleSave = async () => {
         setSaving(true);
         try {
-            const payload = { enabled, strong_only: strongOnly, chat_id: chatId };
+            const payload = { enabled, chat_id: chatId, alert_mode: alertMode };
             if (botToken.trim()) payload.bot_token = botToken.trim();
             const updated = await updateTelegramConfig(payload);
             setConfig(updated);
-            setBotToken(""); // clear input after save
+            setBotToken("");
             toast.success("Telegram settings saved");
         } catch (e) {
             toast.error(e?.response?.data?.detail || "Save failed");
@@ -161,7 +161,7 @@ export default function TelegramSettings() {
                         />
                     </div>
 
-                    {/* Toggles */}
+                    {/* Alert mode selector */}
                     <div className="bg-[#1A1A1A] border border-[#262626] rounded-sm p-3 space-y-3">
                         <div className="flex items-center justify-between">
                             <div>
@@ -176,18 +176,42 @@ export default function TelegramSettings() {
                                 data-testid="alert-enabled-switch"
                             />
                         </div>
-                        <div className="flex items-center justify-between border-t border-[#262626] pt-3">
-                            <div>
-                                <Label className="text-sm text-white font-medium">Strong signals only</Label>
-                                <p className="text-[10px] font-mono text-gray-500 mt-0.5">
-                                    Only DOUBLE CONFIRMED + STRONG/VERY STRONG
-                                </p>
+                        <div className="border-t border-[#262626] pt-3">
+                            <Label className="text-sm text-white font-medium block mb-2">Alert me on</Label>
+                            <div className="grid grid-cols-3 gap-1.5">
+                                {[
+                                    { id: "strong", label: "Strong Only", sub: "DOUBLE + STRONG", color: "#00B86B" },
+                                    { id: "actionable", label: "BUY / SELL", sub: "All actionable", color: "#D4AF37" },
+                                    { id: "all", label: "All Signals", sub: "Including HOLD", color: "#3B82F6" },
+                                ].map((opt) => (
+                                    <button
+                                        key={opt.id}
+                                        type="button"
+                                        onClick={() => setAlertMode(opt.id)}
+                                        data-testid={`mode-${opt.id}-btn`}
+                                        className={`p-2 rounded-sm border text-left transition-all ${
+                                            alertMode === opt.id
+                                                ? "border-[#D4AF37] bg-[#D4AF37]/10"
+                                                : "border-[#262626] bg-[#0F0F0F] hover:border-gray-600"
+                                        }`}
+                                    >
+                                        <div
+                                            className="text-xs font-mono font-bold uppercase tracking-tight"
+                                            style={{ color: alertMode === opt.id ? "#D4AF37" : opt.color }}
+                                        >
+                                            {opt.label}
+                                        </div>
+                                        <div className="text-[9px] font-mono text-gray-500 mt-0.5 leading-tight">
+                                            {opt.sub}
+                                        </div>
+                                    </button>
+                                ))}
                             </div>
-                            <Switch
-                                checked={strongOnly}
-                                onCheckedChange={setStrongOnly}
-                                data-testid="strong-only-switch"
-                            />
+                            <p className="text-[10px] font-mono text-gray-500 mt-2 leading-relaxed">
+                                {alertMode === "strong" && "Only the highest-confidence signals (both AIs agree + STRONG strength). Few alerts, very high quality."}
+                                {alertMode === "actionable" && "Every BUY or SELL signal regardless of strength. HOLD signals skipped."}
+                                {alertMode === "all" && "Every signal pushed to Telegram, including HOLD/neutral. Maximum visibility."}
+                            </p>
                         </div>
                     </div>
 

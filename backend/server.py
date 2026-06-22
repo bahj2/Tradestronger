@@ -920,18 +920,24 @@ class TelegramConfig(BaseModel):
     enabled: bool = False
     bot_token: str = ""
     chat_id: str = ""
-    strong_only: bool = True  # only alert on STRONG/VERY_STRONG + DOUBLE_CONFIRMED
+    strong_only: bool = True  # legacy
+    alert_mode: str = "strong"  # "strong" | "actionable" | "all"
 
 
 async def _get_telegram_config() -> TelegramConfig:
     doc = await db.settings.find_one({"_id": "telegram"})
     if not doc:
         return TelegramConfig()
+    # Back-compat: derive alert_mode from old strong_only if missing
+    mode = doc.get('alert_mode')
+    if not mode:
+        mode = "strong" if doc.get('strong_only', True) else "actionable"
     return TelegramConfig(
         enabled=bool(doc.get('enabled', False)),
         bot_token=str(doc.get('bot_token', '')),
         chat_id=str(doc.get('chat_id', '')),
         strong_only=bool(doc.get('strong_only', True)),
+        alert_mode=mode,
     )
 
 
@@ -1016,13 +1022,20 @@ async def _maybe_send_signal_alert(signal: AISignal) -> None:
         cfg = await _get_telegram_config()
         if not cfg.enabled or not cfg.bot_token or not cfg.chat_id:
             return
-        if signal.action == "HOLD":
-            return
-        if cfg.strong_only:
+
+        mode = cfg.alert_mode
+        if mode == "strong":
+            if signal.action == "HOLD":
+                return
             if signal.consensus != "DOUBLE_CONFIRMED":
                 return
             if signal.signal_strength not in ("STRONG", "VERY_STRONG"):
                 return
+        elif mode == "actionable":
+            if signal.action == "HOLD":
+                return
+        # mode == "all" → no filter
+
         # de-dupe by signal id
         existing = await db.telegram_alerts.find_one({"signal_id": signal.id})
         if existing:
@@ -1034,6 +1047,7 @@ async def _maybe_send_signal_alert(signal: AISignal) -> None:
             "sent_at": datetime.now(timezone.utc).isoformat(),
             "ok": result.get("ok", False),
             "error": result.get("error"),
+            "mode": mode,
         })
     except Exception as e:
         logging.warning(f"Telegram auto-alert failed: {e}")
@@ -1042,7 +1056,6 @@ async def _maybe_send_signal_alert(signal: AISignal) -> None:
 @api_router.get("/telegram/config")
 async def get_telegram_config():
     cfg = await _get_telegram_config()
-    # Mask bot token in response
     masked = ""
     if cfg.bot_token:
         masked = cfg.bot_token[:8] + "…" + cfg.bot_token[-4:] if len(cfg.bot_token) > 14 else "•••"
@@ -1052,6 +1065,7 @@ async def get_telegram_config():
         "has_token": bool(cfg.bot_token),
         "chat_id": cfg.chat_id,
         "strong_only": cfg.strong_only,
+        "alert_mode": cfg.alert_mode,
     }
 
 
@@ -1060,6 +1074,7 @@ class TelegramConfigUpdate(BaseModel):
     bot_token: Optional[str] = None
     chat_id: Optional[str] = None
     strong_only: Optional[bool] = None
+    alert_mode: Optional[str] = None
 
 
 @api_router.post("/telegram/config")
