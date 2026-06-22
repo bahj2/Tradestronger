@@ -8,6 +8,7 @@ import SignalHistory from "@/components/SignalHistory";
 import WinRateTracker from "@/components/WinRateTracker";
 import { Activity } from "lucide-react";
 import { fetchAISignal } from "@/lib/api";
+import TelegramSettings from "@/components/TelegramSettings";
 
 const TIMEFRAMES = [
     { id: "1min", label: "1m" },
@@ -71,6 +72,7 @@ export default function Dashboard() {
                             <span className="w-1.5 h-1.5 rounded-full bg-[#00B86B] live-dot" />
                             <span>LIVE · TWELVEDATA</span>
                         </div>
+                        <TelegramSettings />
                         <button
                             onClick={refresh}
                             data-testid="refresh-btn"

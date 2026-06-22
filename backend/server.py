@@ -735,6 +735,8 @@ async def get_ai_signal(interval: str = Query("1h")):
     await db.ai_signals.insert_one(signal.model_dump())
     payload = signal.model_dump()
     _cache_set(cache_key, payload)
+    # Fire-and-forget Telegram alert (won't block response)
+    asyncio.create_task(_maybe_send_signal_alert(signal))
     return payload
 
 @api_router.get("/signals/history")
@@ -913,7 +915,183 @@ async def get_news(limit: int = Query(12, le=30)):
     items = await _fetch_all_news()
     return {"items": items[:limit]}
 
-# ------------------- News aggregation (multi-source) -------------------
+# ------------------- Telegram Alerts -------------------
+class TelegramConfig(BaseModel):
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+    strong_only: bool = True  # only alert on STRONG/VERY_STRONG + DOUBLE_CONFIRMED
+
+
+async def _get_telegram_config() -> TelegramConfig:
+    doc = await db.settings.find_one({"_id": "telegram"})
+    if not doc:
+        return TelegramConfig()
+    return TelegramConfig(
+        enabled=bool(doc.get('enabled', False)),
+        bot_token=str(doc.get('bot_token', '')),
+        chat_id=str(doc.get('chat_id', '')),
+        strong_only=bool(doc.get('strong_only', True)),
+    )
+
+
+async def _send_telegram(text: str, parse_mode: str = "HTML") -> dict:
+    cfg = await _get_telegram_config()
+    if not cfg.bot_token or not cfg.chat_id:
+        return {"ok": False, "error": "Telegram not configured"}
+    url = f"https://api.telegram.org/bot{cfg.bot_token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(url, json={
+                "chat_id": cfg.chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            })
+            data = r.json()
+            if not data.get('ok'):
+                return {"ok": False, "error": data.get('description', 'Unknown error')}
+            return {"ok": True, "message_id": data['result']['message_id']}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+def _format_signal_message(signal: AISignal) -> str:
+    action = signal.action.upper()
+    emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+    consensus_emoji = {
+        "DOUBLE_CONFIRMED": "✅ DOUBLE CONFIRMED",
+        "SINGLE_SOURCE": "⚠️ SINGLE SOURCE",
+        "CONFLICTED": "⚡ CONFLICTED",
+    }.get(signal.consensus or "", signal.consensus or "")
+
+    def f(n, d=2):
+        return f"{n:,.{d}f}" if n is not None else "—"
+
+    tp_lines = []
+    if signal.tp1 is not None:
+        tp_lines.append(f"  TP1: <code>{f(signal.tp1)}</code>")
+    if signal.tp2 is not None:
+        tp_lines.append(f"  TP2: <code>{f(signal.tp2)}</code>")
+    if signal.tp3 is not None:
+        tp_lines.append(f"  TP3: <code>{f(signal.tp3)}</code>")
+    tp_block = "\n".join(tp_lines) if tp_lines else f"  TP: <code>{f(signal.take_profit)}</code>"
+
+    valid_str = f"{signal.valid_for_minutes}m" if signal.valid_for_minutes else "—"
+    rr_str = f"{signal.risk_reward:.1f}" if signal.risk_reward else "—"
+
+    return (
+        f"{emoji} <b>{action} XAU/USD · {signal.signal_strength or ''}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Timeframe: <b>{signal.timeframe}</b>\n"
+        f"🎯 Confidence: <b>{signal.confidence}%</b>\n"
+        f"🤖 {consensus_emoji}\n\n"
+        f"💰 Entry: <code>{f(signal.entry)}</code>\n"
+        f"🛑 Stop Loss: <code>{f(signal.stop_loss)}</code>\n"
+        f"{tp_block}\n\n"
+        f"⚖️ R:R: <b>{rr_str}</b>\n"
+        f"⏳ Valid: <b>{valid_str}</b>\n"
+        f"💵 DXY: <code>{f(signal.dxy_price)} ({signal.dxy_change_pct:+.2f}%)</code>\n\n"
+        f"<i>{signal.summary}</i>\n\n"
+        f"<b>— AURUM Terminal</b>"
+        if signal.dxy_price is not None else
+        f"{emoji} <b>{action} XAU/USD · {signal.signal_strength or ''}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Timeframe: <b>{signal.timeframe}</b>\n"
+        f"🎯 Confidence: <b>{signal.confidence}%</b>\n"
+        f"🤖 {consensus_emoji}\n\n"
+        f"💰 Entry: <code>{f(signal.entry)}</code>\n"
+        f"🛑 Stop Loss: <code>{f(signal.stop_loss)}</code>\n"
+        f"{tp_block}\n\n"
+        f"⚖️ R:R: <b>{rr_str}</b>\n"
+        f"⏳ Valid: <b>{valid_str}</b>\n\n"
+        f"<i>{signal.summary}</i>\n\n"
+        f"<b>— AURUM Terminal</b>"
+    )
+
+
+async def _maybe_send_signal_alert(signal: AISignal) -> None:
+    """Send Telegram alert if conditions are met. Non-blocking."""
+    try:
+        cfg = await _get_telegram_config()
+        if not cfg.enabled or not cfg.bot_token or not cfg.chat_id:
+            return
+        if signal.action == "HOLD":
+            return
+        if cfg.strong_only:
+            if signal.consensus != "DOUBLE_CONFIRMED":
+                return
+            if signal.signal_strength not in ("STRONG", "VERY_STRONG"):
+                return
+        # de-dupe by signal id
+        existing = await db.telegram_alerts.find_one({"signal_id": signal.id})
+        if existing:
+            return
+        text = _format_signal_message(signal)
+        result = await _send_telegram(text)
+        await db.telegram_alerts.insert_one({
+            "signal_id": signal.id,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "ok": result.get("ok", False),
+            "error": result.get("error"),
+        })
+    except Exception as e:
+        logging.warning(f"Telegram auto-alert failed: {e}")
+
+
+@api_router.get("/telegram/config")
+async def get_telegram_config():
+    cfg = await _get_telegram_config()
+    # Mask bot token in response
+    masked = ""
+    if cfg.bot_token:
+        masked = cfg.bot_token[:8] + "…" + cfg.bot_token[-4:] if len(cfg.bot_token) > 14 else "•••"
+    return {
+        "enabled": cfg.enabled,
+        "bot_token_masked": masked,
+        "has_token": bool(cfg.bot_token),
+        "chat_id": cfg.chat_id,
+        "strong_only": cfg.strong_only,
+    }
+
+
+class TelegramConfigUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    bot_token: Optional[str] = None
+    chat_id: Optional[str] = None
+    strong_only: Optional[bool] = None
+
+
+@api_router.post("/telegram/config")
+async def update_telegram_config(payload: TelegramConfigUpdate):
+    update = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    if not update:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    await db.settings.update_one(
+        {"_id": "telegram"},
+        {"$set": update},
+        upsert=True,
+    )
+    return await get_telegram_config()
+
+
+@api_router.post("/telegram/test")
+async def telegram_send_test():
+    cfg = await _get_telegram_config()
+    if not cfg.bot_token or not cfg.chat_id:
+        raise HTTPException(status_code=400, detail="Bot token and chat ID required")
+    text = (
+        "🟢 <b>AURUM Terminal · Test Message</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "If you see this, Telegram alerts are configured correctly.\n\n"
+        "You'll receive a message like this each time a "
+        "<b>STRONG + DOUBLE CONFIRMED</b> signal is generated.\n\n"
+        "<i>Happy trading! 🚀</i>"
+    )
+    result = await _send_telegram(text)
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error", "Send failed"))
+    return result
 NEWS_QUERIES = [
     ("Gold Market", "gold+price+XAUUSD+OR+%22gold+market%22"),
     ("Fed / FOMC", "federal+reserve+OR+FOMC+rate+gold"),
