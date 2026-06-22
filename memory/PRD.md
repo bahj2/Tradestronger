@@ -4,45 +4,80 @@
 > how can you help me build trading XAUUSD buy or sell type web but like tradingview but strong Analye ??
 
 ## User Choices
-- Data source: TwelveData (real-time XAU/USD)
-- Analysis: AI summary + technical indicators (both)
-- Features: Live candlestick chart with timeframes, AI Buy/Sell signal w/ confidence, Technical indicators, News feed
+- Data source: TwelveData (primary) + Yahoo Finance GC=F (fallback)
+- Analysis: Rule Engine (free) + Dual-AI Ensemble (Claude Sonnet 4.5 + Gemini 3.1 Pro)
+- Features: Live candlestick chart with timeframes, AI Buy/Sell signal w/ confidence, Technical indicators, News feed, Telegram alerts, MT5 EA auto-trader
 - Auth: Public dashboard (no login)
-- Visual: Dark professional trader theme
-- AI: Claude Sonnet 4.5 via Emergent Universal LLM Key
+- Visual: Dark professional trader theme (gold accent on near-black)
+- AI: Claude Sonnet 4.5 + Gemini 3.1 Pro via Emergent Universal LLM Key
 
 ## Architecture
 - **Frontend**: React + TailwindCSS + lightweight-charts + shadcn (sonner) on port 3000
 - **Backend**: FastAPI on port 8001 with `/api` prefix
-- **DB**: MongoDB for AI signal history
-- **External**: TwelveData REST API (quote, time_series) + Claude Sonnet 4.5 (LLM) + Google News RSS
+- **DB**: MongoDB for AI signal history + telegram config
+- **External**: TwelveData (quote, time_series) + Yahoo Finance (fallback) + Claude + Gemini (LLM) + Google News RSS + Telegram Bot API
 
 ## Endpoints
 - `GET /api/market/quote` — live XAU/USD quote
 - `GET /api/market/candles?interval=1h&size=200` — OHLCV candles
 - `GET /api/analysis/indicators?interval=1h` — RSI, MACD, EMA(20/50/200), Bollinger
-- `GET /api/analysis/ai?interval=1h` — AI buy/sell signal + reasoning
-- `GET /api/signals/history` — past AI signals
+- `GET /api/analysis/ai?interval=1h&engine=rule|ai&auto_upgrade=true|false` — signal + reasoning. Returns `sl_method` (ATR-derived or % fallback) and `auto_upgraded` flag.
+- `GET /api/signals/history` — past signals
+- `GET /api/signals/stats` — win rate, avg R-multiple, per-timeframe, 7d/30d windows, best streak
 - `GET /api/news` — gold market news (Google News RSS)
+- `GET /api/ea/signal`, `GET /api/ea/download`, `POST /api/ea/event` — MT5 Expert Advisor endpoints
+- `POST /api/telegram/config`, `POST /api/telegram/test`, `POST /api/telegram/send-ea` — Telegram integration
 
-## Implemented (Feb 2026 — Phase 1)
-- ✅ Real-time XAU/USD ticker bar with tick flash animations
+## Implemented (Feb 2026)
+
+### Phase 1 — Core (✅ Complete)
+- ✅ Real-time XAU/USD ticker bar with tick-flash animations
 - ✅ Candlestick chart (lightweight-charts) with 6 timeframes (1m, 5m, 15m, 1h, 4h, 1d)
 - ✅ AI signal card with action (BUY/SELL/HOLD), confidence %, entry/SL/TP, verdict, reasoning
 - ✅ Technical indicators panel (RSI gauge, MACD, EMAs vs price, Bollinger Bands)
 - ✅ Signal history table (persisted in MongoDB)
 - ✅ Gold market news feed (Google News RSS)
 - ✅ Institutional dark theme (Chivo + JetBrains Mono fonts, gold accent)
-- ✅ Auto-refresh (quote 20s, chart 30s, AI cached 120s)
+- ✅ Auto-refresh (quote 20s, chart 30s, AI cached 60s/180s)
+
+### Phase 2 — Intelligence (✅ Complete)
+- ✅ Dual-AI Ensemble (Claude Sonnet 4.5 + Gemini 3.1 Pro) with consensus voting
+- ✅ DOUBLE_CONFIRMED / MAJORITY / CONFLICTED / SINGLE_SOURCE consensus badges
+- ✅ Multi-timeframe context (higher-TF trend + lower-TF momentum)
+- ✅ DXY inverse-correlation factor + news headlines fed into AI prompt
+- ✅ Free deterministic Rule Engine — no LLM cost, sub-second response
+
+### Phase 3 — Performance Tracking (✅ Complete)
+- ✅ Win-rate tracker (auto-grades past signals against historical candles)
+- ✅ R-multiple, per-timeframe stats, 7d/30d windows, best streak
+
+### Phase 4 — Alerting & Auto-Trading (✅ Complete)
+- ✅ Telegram alerts (signal new, TP1/TP2/TP3 hit, SL hit) with bot setup modal
+- ✅ MT5 Expert Advisor (AurumXAUUSD.mq5) — downloadable, polls /api/ea/signal, auto-executes BUY/SELL, reports lifecycle back via /api/ea/event
+- ✅ Telegram lifecycle messages from EA reports
+
+### Phase 5 — Volatility-Aware Risk (✅ Complete — Feb 22, 2026)
+- ✅ ATR-based SL/TP calculation (replaces fixed % SL) — multipliers tuned per TF: 1m=1.0x, 5m=1.2x, 15m=1.4x, 1h=1.6x, 4h=1.8x, 1d=2.0x
+- ✅ `sl_method` field surfaced in API + UI (shows "ATR(45.36) × 1.6" or "1.8% of price" fallback)
+- ✅ TP ladder uses 1R/2R/3R from ATR-derived SL distance (proper risk-reward)
+- ✅ **Auto-upgrade to Deep AI** toggle: free Rule Engine watches continuously, when it flags STRONG/VERY_STRONG → auto-escalates to Dual-AI (Claude + Gemini) for cross-checked verdict. Saves LLM tokens vs. continuous polling.
+- ✅ **Strong-only filter** toggle: suppresses chart overlays + adds blocking warning when signal_strength ∉ {STRONG, VERY_STRONG} — prevents low-quality trades.
+- ✅ Backend tests: 21 passed, 1 skipped (market-dependent). Test file at `/app/backend/tests/test_auto_upgrade.py`.
 
 ## Backlog (P1)
-- Multi-asset support (silver, oil, BTCUSD)
-- Trade journal: log simulated trades & P/L
-- Custom alerts: price/RSI/MACD triggers via email/Telegram
-- Backtesting framework on AI signals
+- Mobile responsive UI redesign (current desktop-first design breaks under 768px)
+- News-blackout filter (skip signals 15min before/after high-impact USD news like NFP/FOMC)
+- Trailing-stop simulation (model break-even move after TP1 hits → realized R boost)
+- Improve TwelveData 429-as-500 leak → graceful 429 with Retry-After or stale-cache fallback
 
 ## Backlog (P2)
-- WebSocket live tick stream (replace polling)
-- Drawing tools on chart (trendlines, fibs)
-- Account/portfolio sync (broker APIs)
-- Mobile responsive optimization pass
+- Multi-asset expansion (Silver, BTC, EUR/USD, Oil) reusing existing rule + AI engine
+- Risk Calculator (compute position size in oz/lots from account size + risk %)
+- WebSocket tick stream (replace 20s polling)
+- Drawing tools on chart (trendlines, Fib retracements)
+- Refactor `/app/backend/server.py` (1893 lines) into FastAPI routers: market, analysis, signals, ea, telegram
+
+## Health
+- Backend: ✅ Running, lint clean
+- Frontend: ✅ Running, lint clean
+- All endpoints tested end-to-end via testing agent (iteration_2.json: 100% pass rate on targeted features)
