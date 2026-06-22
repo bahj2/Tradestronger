@@ -234,6 +234,7 @@ void ManageOpenPositions()
       if(StringFind(comment, "AURUM") < 0) continue;
       if(StringFind(comment, "TP1=") < 0) continue;
 
+      string pos_sig_id = ExtractSignalId(comment);
       double entry = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl    = PositionGetDouble(POSITION_SL);
       double tp1   = ParseCommentNum(comment, "TP1=");
@@ -272,7 +273,7 @@ void ManageOpenPositions()
             double tick_size  = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
             double profit_est = (tick_size > 0) ? (locked / tick_size) * tick_value * close_vol : 0;
             string side = (ptype == POSITION_TYPE_BUY) ? "BUY" : "SELL";
-            ReportToAurum("SCALED_OUT", "", ticket, side, close_vol, tp1, sl, current_tp, profit_est, "");
+            ReportToAurum("SCALED_OUT", pos_sig_id, ticket, side, close_vol, tp1, sl, current_tp, profit_est, "");
          }
       }
 
@@ -281,7 +282,7 @@ void ManageOpenPositions()
       {
          Print("SL moved to breakeven on ticket ", ticket);
          string side = (ptype == POSITION_TYPE_BUY) ? "BUY" : "SELL";
-         ReportToAurum("MOVED_BE", "", ticket, side, 0, entry, entry, current_tp, 0, "");
+         ReportToAurum("MOVED_BE", pos_sig_id, ticket, side, 0, entry, entry, current_tp, 0, "");
       }
    }
 }
@@ -388,6 +389,16 @@ double ParseCommentNum(string comment, string tag)
    int sep = StringFind(rest, "|");
    if(sep >= 0) rest = StringSubstr(rest, 0, sep);
    return StringToDouble(rest);
+}
+
+string ExtractSignalId(string comment)
+{
+   int p1 = StringFind(comment, "AURUM|");
+   if(p1 < 0) return "";
+   string rest = StringSubstr(comment, p1 + 6);
+   int p2 = StringFind(rest, "|");
+   if(p2 > 0) return StringSubstr(rest, 0, p2);
+   return rest;
 }
 
 //+------------------------------------------------------------------+

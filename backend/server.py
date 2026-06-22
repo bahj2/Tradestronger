@@ -812,15 +812,44 @@ def _format_ea_event_message(e: EAEvent) -> str:
 
 @api_router.post("/ea/event")
 async def ea_event(event: EAEvent):
-    """Receive trade events from the EA and forward to Telegram."""
+    """Receive trade events from the EA. If signal_id matches a known thread,
+    edit the original Telegram message to include the lifecycle event.
+    Otherwise send a standalone message."""
     await db.ea_events.insert_one({
         **event.model_dump(),
         "received_at": datetime.now(timezone.utc).isoformat(),
     })
+
     cfg = await _get_telegram_config()
-    if cfg.enabled and cfg.bot_token and cfg.chat_id:
+    if not (cfg.enabled and cfg.bot_token and cfg.chat_id):
+        return {"ok": True}
+
+    # Try to find an existing trade thread for this signal
+    thread = None
+    if event.signal_id:
+        thread = await db.trade_threads.find_one({"signal_id": event.signal_id})
+
+    field_map = {
+        "OPENED": "opened",
+        "SCALED_OUT": "scaled_out",
+        "MOVED_BE": "moved_be",
+        "CLOSED": "closed",
+    }
+    field = field_map.get(event.event)
+
+    if thread and field:
+        await db.trade_threads.update_one(
+            {"signal_id": event.signal_id},
+            {"$set": {field: event.model_dump()}},
+        )
+        thread = await db.trade_threads.find_one({"signal_id": event.signal_id})
+        new_text = _render_combined_message(thread)
+        await _edit_telegram_message(thread["message_id"], new_text)
+    else:
+        # No thread or unknown event type — fall back to standalone message
         text = _format_ea_event_message(event)
         await _send_telegram(text)
+
     return {"ok": True}
 
 
@@ -1099,6 +1128,28 @@ async def _send_telegram(text: str, parse_mode: str = "HTML") -> dict:
         return {"ok": False, "error": str(e)[:200]}
 
 
+async def _edit_telegram_message(message_id: int, text: str, parse_mode: str = "HTML") -> dict:
+    cfg = await _get_telegram_config()
+    if not cfg.bot_token or not cfg.chat_id or not message_id:
+        return {"ok": False, "error": "Missing config or message_id"}
+    url = f"https://api.telegram.org/bot{cfg.bot_token}/editMessageText"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(url, json={
+                "chat_id": cfg.chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            })
+            data = r.json()
+            if not data.get('ok'):
+                return {"ok": False, "error": data.get('description', 'Unknown')}
+            return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
 def _format_signal_message(signal: AISignal) -> str:
     action = signal.action.upper()
     emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
@@ -1153,8 +1204,83 @@ def _format_signal_message(signal: AISignal) -> str:
     )
 
 
+def _render_combined_message(thread: dict) -> str:
+    """Render the full lifecycle message from accumulated state."""
+    sig = thread.get("signal") or {}
+    opened = thread.get("opened")
+    scaled = thread.get("scaled_out")
+    be = thread.get("moved_be")
+    closed = thread.get("closed")
+
+    action = sig.get("action", "")
+    emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+    sym = "XAU/USD"
+
+    def f(n, d=2):
+        if n is None:
+            return "—"
+        return f"{n:,.{d}f}"
+
+    lines = [
+        f"{emoji} <b>{action} {sym} · {sig.get('signal_strength', '')}</b>",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"📊 TF: <b>{sig.get('timeframe', '?')}</b>  ·  🎯 Confidence: <b>{sig.get('confidence', '?')}%</b>",
+        f"🤖 Consensus: <b>{sig.get('consensus', '?')}</b>",
+        "",
+        f"💰 Entry: <code>{f(sig.get('entry'))}</code>",
+        f"🛑 Stop Loss: <code>{f(sig.get('stop_loss'))}</code>",
+    ]
+    if sig.get("tp1") is not None:
+        lines.append(f"   ├ TP1: <code>{f(sig['tp1'])}</code>")
+    if sig.get("tp2") is not None:
+        lines.append(f"   ├ TP2: <code>{f(sig['tp2'])}</code>")
+    if sig.get("tp3") is not None:
+        lines.append(f"   └ TP3: <code>{f(sig['tp3'])}</code>")
+
+    rr = sig.get("risk_reward")
+    valid = sig.get("valid_for_minutes")
+    rr_str = f"{rr:.1f}" if rr else "—"
+    extra_bits = [f"⚖️ R:R: <b>{rr_str}</b>"]
+    if valid:
+        extra_bits.append(f"⏳ Valid: <b>{valid}m</b>")
+    if sig.get("dxy_price") is not None:
+        extra_bits.append(f"💵 DXY: <code>{f(sig['dxy_price'])} ({sig.get('dxy_change_pct', 0):+.2f}%)</code>")
+    lines.append(" · ".join(extra_bits))
+
+    if sig.get("summary"):
+        lines.extend(["", f"<i>{sig['summary']}</i>"])
+
+    # EA trade lifecycle (only if any event happened)
+    if opened or scaled or be or closed:
+        lines.extend(["", "━ <b>EA TRADE LIFECYCLE</b> ━"])
+        if opened:
+            lines.append(
+                f"🤖 <b>OPENED</b> · {f(opened.get('lot'))} lots @ <code>{f(opened.get('price'))}</code>"
+                f" · 🎟 #{opened.get('ticket')}"
+            )
+        if scaled:
+            lines.append(
+                f"💰 <b>TP1 HIT</b> · closed {f(scaled.get('lot'))} lots @ <code>{f(scaled.get('price'))}</code>"
+                f" · locked <b>${scaled.get('profit', 0):+.2f}</b>"
+            )
+        if be:
+            lines.append("🛡️ <b>SL → Breakeven</b> · runner is risk-free")
+        if closed:
+            profit = closed.get('profit', 0) or 0
+            win = profit >= 0
+            emoji_c = "✅" if win else "❌"
+            sign = "+" if win else ""
+            lines.append(
+                f"{emoji_c} <b>CLOSED</b> @ <code>{f(closed.get('price'))}</code> · "
+                f"P/L: <b>{sign}${profit:.2f}</b>"
+            )
+
+    lines.extend(["", "<b>— AURUM Terminal</b>"])
+    return "\n".join(lines)
+
+
 async def _maybe_send_signal_alert(signal: AISignal) -> None:
-    """Send Telegram alert if conditions are met. Non-blocking."""
+    """Send Telegram alert if conditions are met, store as a trade thread for live updates."""
     try:
         cfg = await _get_telegram_config()
         if not cfg.enabled or not cfg.bot_token or not cfg.chat_id:
@@ -1171,21 +1297,42 @@ async def _maybe_send_signal_alert(signal: AISignal) -> None:
         elif mode == "actionable":
             if signal.action == "HOLD":
                 return
-        # mode == "all" → no filter
 
-        # de-dupe by signal id
         existing = await db.telegram_alerts.find_one({"signal_id": signal.id})
         if existing:
             return
-        text = _format_signal_message(signal)
+
+        # Build initial combined-style message (no EA events yet)
+        thread_doc = {"signal_id": signal.id, "signal": signal.model_dump()}
+        text = _render_combined_message(thread_doc)
         result = await _send_telegram(text)
+
         await db.telegram_alerts.insert_one({
             "signal_id": signal.id,
             "sent_at": datetime.now(timezone.utc).isoformat(),
             "ok": result.get("ok", False),
             "error": result.get("error"),
             "mode": mode,
+            "message_id": result.get("message_id"),
         })
+
+        # Store thread for future EA event updates (only if message went through)
+        if result.get("ok") and result.get("message_id"):
+            await db.trade_threads.update_one(
+                {"signal_id": signal.id},
+                {"$set": {
+                    "signal_id": signal.id,
+                    "chat_id": cfg.chat_id,
+                    "message_id": result["message_id"],
+                    "signal": signal.model_dump(),
+                    "opened": None,
+                    "scaled_out": None,
+                    "moved_be": None,
+                    "closed": None,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }},
+                upsert=True,
+            )
     except Exception as e:
         logging.warning(f"Telegram auto-alert failed: {e}")
 
