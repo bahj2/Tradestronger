@@ -87,7 +87,7 @@ function StepRow({ icon: Icon, title, text, testId }) {
     );
 }
 
-export default function AISignalCard({ signal, loading, error, onRegenerate, onDeepAI, engine, confidenceThreshold = 0 }) {
+export default function AISignalCard({ signal, loading, error, onRegenerate, onDeepAI, engine, confidenceThreshold = 0, strongOnly = false }) {
     const action = (signal?.action || "HOLD").toUpperCase();
     const style = actionStyle[action] || actionStyle.HOLD;
     const Icon = style.Icon;
@@ -102,9 +102,16 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
     const consensus = signal?.consensus ? consensusStyle[signal.consensus] : null;
     const ConsensusIcon = consensus?.Icon;
     const belowThreshold = signal && signal.confidence < confidenceThreshold;
+    const blockedByStrongFilter = signal
+        && strongOnly
+        && action !== "HOLD"
+        && !["STRONG", "VERY_STRONG"].includes(signal.signal_strength);
+    const muted = belowThreshold || blockedByStrongFilter;
     const steps = signal?.analysis_steps;
     const votes = signal?.votes || [];
     const newsSources = signal?.news_sources || [];
+    const autoUpgraded = !!signal?.auto_upgraded;
+    const slMethod = signal?.sl_method;
 
     return (
         <div
@@ -114,11 +121,11 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
         >
             <div className="flex items-center justify-between px-4 py-2 border-b border-[#262626]">
                 <div className="flex items-center gap-2">
-                    {engine === "ai" ? (
+                    {engine === "ai" || autoUpgraded ? (
                         <>
                             <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
                             <span className="text-[10px] font-mono text-[#D4AF37] uppercase tracking-[0.2em]">
-                                Deep AI · Claude + Gemini
+                                {autoUpgraded ? "Auto-Upgraded · Claude + Gemini" : "Deep AI · Claude + Gemini"}
                             </span>
                         </>
                     ) : (
@@ -174,6 +181,17 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
 
             {signal && (
                 <div className="p-4 space-y-4">
+                    {/* Auto-upgraded info banner */}
+                    {autoUpgraded && (
+                        <div
+                            className="px-3 py-2 border border-[#D4AF37]/40 bg-[#D4AF37]/10 rounded-sm text-[10px] font-mono uppercase tracking-[0.15em] text-[#D4AF37] flex items-center gap-2"
+                            data-testid="auto-upgrade-banner"
+                        >
+                            <Sparkles className="w-3 h-3" />
+                            Rule engine flagged STRONG → auto-upgraded to Dual-AI verdict
+                        </div>
+                    )}
+
                     {/* Below-threshold warning */}
                     {belowThreshold && (
                         <div
@@ -184,10 +202,20 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
                         </div>
                     )}
 
+                    {/* Strong-only block warning */}
+                    {blockedByStrongFilter && !belowThreshold && (
+                        <div
+                            className="px-3 py-2 border border-[#FF2A55]/40 bg-[#FF2A55]/10 rounded-sm text-[10px] font-mono uppercase tracking-[0.15em] text-[#FF2A55]"
+                            data-testid="strong-only-warning"
+                        >
+                            ⚠ {signal.signal_strength?.replace("_", " ")} setup blocked by Strong-only filter — wait for STRONG signal.
+                        </div>
+                    )}
+
                     {/* Action + confidence */}
                     <div
                         className="flex items-center justify-between px-4 py-3 rounded-sm border"
-                        style={{ background: style.bg, borderColor: style.border, opacity: belowThreshold ? 0.5 : 1 }}
+                        style={{ background: style.bg, borderColor: style.border, opacity: muted ? 0.5 : 1 }}
                         data-testid="ai-action-display"
                     >
                         <div className="flex items-center gap-3">
@@ -302,6 +330,16 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
                             </div>
                         </div>
                     </div>
+
+                    {slMethod && (
+                        <div
+                            className="text-[9px] font-mono text-gray-500 uppercase tracking-[0.15em] -mt-2"
+                            data-testid="sl-method"
+                            title="Volatility-aware SL distance source"
+                        >
+                            SL distance · <span className="text-[#D4AF37]">{slMethod}</span>
+                        </div>
+                    )}
 
                     {/* TP ladder */}
                     {tps.length > 0 && (

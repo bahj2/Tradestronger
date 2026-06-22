@@ -10,8 +10,11 @@ export const fetchCandles = (interval, size = 150) =>
     api.get("/market/candles", { params: { interval, size } }).then(r => r.data);
 export const fetchIndicators = (interval) =>
     api.get("/analysis/indicators", { params: { interval } }).then(r => r.data);
-export const fetchAISignal = (interval, engine = "rule") =>
-    api.get("/analysis/ai", { params: { interval, engine } }).then(r => r.data);
+export const fetchAISignal = (interval, engine = "rule", autoUpgrade = false) =>
+    api.get("/analysis/ai", {
+        params: { interval, engine, auto_upgrade: autoUpgrade },
+        timeout: 75000,  // Dual-LLM ensemble can take 30-60s; rule engine returns in <2s
+    }).then(r => r.data);
 export const fetchSignalHistory = (limit = 10) =>
     api.get("/signals/history", { params: { limit } }).then(r => r.data);
 export const fetchNews = (limit = 12) =>

@@ -309,6 +309,10 @@ class AISignal(BaseModel):
     consensus: Optional[str] = None  # DOUBLE_CONFIRMED / MAJORITY / CONFLICTED / SINGLE_SOURCE
     votes: Optional[List[AIVote]] = None
     news_sources: Optional[List[Dict[str, str]]] = None  # headlines used in analysis
+    # Volatility-aware SL/TP origin (e.g. "ATR(2.40) × 1.6" or "1.8% of price")
+    sl_method: Optional[str] = None
+    # True when rule engine produced STRONG and we auto-escalated to Dual-AI
+    auto_upgraded: bool = False
 
 # ------------------- Routes -------------------
 @api_router.get("/")
@@ -818,6 +822,7 @@ def _rule_engine_analyze(
         "news_sentiment": "NEUTRAL",
         "summary": summary,
         "reasoning": reasoning,
+        "sl_method": sl_method,
         "analysis_steps": {
             "trend": f"Higher TF: {higher_trend} · Primary: {_trend_label(snapshot)} · Lower TF: {lower_trend}",
             "momentum": f"RSI {rsi_str} · MACD {macd_str} cross",
@@ -827,7 +832,8 @@ def _rule_engine_analyze(
                 if dxy else "DXY unavailable"
             ),
             "verdict": (
-                f"Combined factor score {score:+.1f} → {action} with {strength.replace('_', ' ')} strength."
+                f"Combined factor score {score:+.1f} → {action} with {strength.replace('_', ' ')} strength. "
+                f"SL distance derived from {sl_method}."
             ),
         },
     }
@@ -927,8 +933,9 @@ def _compute_consensus(claude_parsed: Optional[dict], gpt_parsed: Optional[dict]
 async def get_ai_signal(
     interval: str = Query("1h"),
     engine: str = Query("rule"),  # "rule" (free, default) or "ai" (dual-LLM)
+    auto_upgrade: bool = Query(False),  # When engine=rule and signal is STRONG, auto-escalate to dual-LLM
 ):
-    cache_key = f"ai:{engine}:{interval}"
+    cache_key = f"ai:{engine}:au{int(auto_upgrade)}:{interval}"
     cached = _cache_get(cache_key, ttl_seconds=180 if engine == "ai" else 60)
     if cached:
         return cached
@@ -952,21 +959,75 @@ async def get_ai_signal(
     news_titles = await _safe_news_titles(limit=10)
     news_items = await _safe_news_items(limit=8)
 
+    auto_upgraded = False
+
     # ===== Branch on engine =====
     if engine == "rule":
         parsed = _rule_engine_analyze(
             snapshot, interval, higher_snap, lower_snap, dxy, news_titles,
             candles=candles_resp.get('candles'),
         )
-        votes = [AIVote(
-            model="AURUM Rule Engine",
-            model_id="rule",
-            action=parsed["action"],
-            confidence=parsed["confidence"],
-            summary=parsed["summary"],
-            available=True,
-        )]
-        consensus = "SINGLE_SOURCE"
+        # Auto-upgrade: if user opted in and rule engine emitted a STRONG/VERY_STRONG signal,
+        # escalate to the Dual-AI ensemble for cross-checked, higher-quality reasoning.
+        rule_strength = str(parsed.get("signal_strength", "")).upper()
+        rule_action = str(parsed.get("action", "HOLD")).upper()
+        should_upgrade = (
+            auto_upgrade
+            and EMERGENT_LLM_KEY
+            and rule_action in ("BUY", "SELL")
+            and rule_strength in ("STRONG", "VERY_STRONG")
+        )
+        if should_upgrade:
+            try:
+                prompt = _build_strong_prompt(
+                    snapshot=snapshot, interval=interval,
+                    recent_candles=candles_resp['candles'],
+                    higher_snap=higher_snap, lower_snap=lower_snap,
+                    higher_tf=higher_tf, lower_tf=lower_tf,
+                    dxy=dxy, news_titles=news_titles,
+                )
+                claude_task = _run_single_ai("anthropic", "claude-sonnet-4-5-20250929", prompt, "claude")
+                gpt_task = _run_single_ai("gemini", "gemini-3.1-pro-preview", prompt, "gemini")
+                claude_parsed, gpt_parsed = await asyncio.gather(claude_task, gpt_task)
+                consensus_up, parsed_up, votes_up = _compute_consensus(claude_parsed, gpt_parsed)
+                if consensus_up != "FAILED" and parsed_up:
+                    # Keep ATR-derived sl_method from rule pass for transparency
+                    parsed_up.setdefault("sl_method", parsed.get("sl_method"))
+                    parsed = parsed_up
+                    votes = votes_up
+                    consensus = consensus_up
+                    auto_upgraded = True
+                else:
+                    votes = [AIVote(
+                        model="AURUM Rule Engine",
+                        model_id="rule",
+                        action=parsed["action"],
+                        confidence=parsed["confidence"],
+                        summary=parsed["summary"],
+                        available=True,
+                    )]
+                    consensus = "SINGLE_SOURCE"
+            except Exception as up_err:
+                logging.warning(f"Auto-upgrade to Deep AI failed, falling back to rule: {up_err}")
+                votes = [AIVote(
+                    model="AURUM Rule Engine",
+                    model_id="rule",
+                    action=parsed["action"],
+                    confidence=parsed["confidence"],
+                    summary=parsed["summary"],
+                    available=True,
+                )]
+                consensus = "SINGLE_SOURCE"
+        else:
+            votes = [AIVote(
+                model="AURUM Rule Engine",
+                model_id="rule",
+                action=parsed["action"],
+                confidence=parsed["confidence"],
+                summary=parsed["summary"],
+                available=True,
+            )]
+            consensus = "SINGLE_SOURCE"
     else:
         if not EMERGENT_LLM_KEY:
             raise HTTPException(status_code=500, detail="LLM key not configured")
@@ -1052,6 +1113,8 @@ async def get_ai_signal(
         consensus=consensus,
         votes=votes,
         news_sources=[{'title': i.get('title', ''), 'source': i.get('source', ''), 'link': i.get('link', '')} for i in news_items],
+        sl_method=parsed.get('sl_method'),
+        auto_upgraded=auto_upgraded,
     )
 
     await db.ai_signals.insert_one(signal.model_dump())

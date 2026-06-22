@@ -1,0 +1,45 @@
+{
+  "summary": "Backend-only testing for ATR-based SL/TP, Auto-upgrade to Deep AI, Strong-only flag, and supporting endpoints. Created /app/backend/tests/test_auto_upgrade.py with 14 tests covering: AISignal serialization (sl_method, auto_upgraded), rule engine ATR formatting on 1h and 1day, auto-upgrade Dual-AI ensemble (Claude+Gemini) on STRONG/VERY_STRONG, negative path (WEAK/HOLD → no upgrade), engine=ai explicit path, cache separation by auto_upgrade flag, /api/signals/stats schema, and smoke checks (quote, candles, news, EA download, EA signal). Full suite (test_auto_upgrade.py + regression test_xauusd_api.py): 21 passed, 1 skipped. The skipped negative-path test triggered because the 5min TF emitted STRONG at test time (market dependent) — the test correctly self-skips in that case rather than producing a false-negative. All cases for sl_method format, auto-upgrade contract, and dual-AI votes validated.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/analysis/ai", "issue": "Negative-path coverage for auto_upgrade=true + WEAK/HOLD is market-dependent — relies on 5min TF being choppy. Consider adding an internal stub/flag to deterministically force the rule engine to emit WEAK in tests, or expose an `_engine_only=true` debug param. Currently the test self-skips when 5min happens to be STRONG."},
+      {"endpoint": "/api/analysis/ai (TwelveData)", "issue": "Carried over from iteration 1: when TwelveData returns 429, httpx.raise_for_status() leaks as HTTP 500 with no graceful fallback. Tests use a 40s retry to absorb this, but the user-facing UX is poor during free-tier quota windows."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_auto_upgrade.py",
+    "/app/backend/tests/test_xauusd_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Add deterministic way to force rule engine WEAK output for testing the negative auto-upgrade path (currently market-dependent).",
+    "(Low priority, carried over) Wrap TwelveData td_get() in try/except for httpx.HTTPStatusError and translate 429 → HTTP 429 with Retry-After, or fall back to stale cache."
+  ],
+  "critical_code_review_comments": [
+    "server.py:992-999 — auto-upgrade path correctly preserves sl_method from the rule pass via parsed_up.setdefault('sl_method', parsed.get('sl_method')). Good.",
+    "server.py:938 — cache_key f'ai:{engine}:au{int(auto_upgrade)}:{interval}' correctly includes the auto_upgrade flag → engine=rule&auto_upgrade=true and =false are cached under separate keys. Verified by test.",
+    "server.py:1031-1047 — engine=ai path never sets auto_upgraded=True (only the rule→upgrade branch does). Contract is clean and matches the test assertion.",
+    "server.py:758-773 — ATR fallback to percent-of-price is properly handled and the sl_method string format follows 'ATR(<num>) × <mult>' for the ATR branch and '<x.x>% of price' for the fallback.",
+    "server.py:1389-1447 — /api/signals/stats returns all required numeric fields (total/wins/losses/expired/win_rate/avg_r) per overall, by_timeframe rows, period_7d, period_30d, plus best_streak. Schema matches spec.",
+    "server.py:1462-1465 — /api/news endpoint capped at 30 limit but no Pydantic response_model — minor; works fine.",
+    "server.py overall — single file is 1893 lines; consider splitting into routers (market, analysis, signals, ea, telegram) for maintainability. Not blocking.",
+    "All MongoDB queries correctly exclude _id via projection {'_id': 0}. No serialization leak observed.",
+    "Auto-upgrade exception path (server.py:1010-1020) correctly falls back to the rule-only vote with consensus='SINGLE_SOURCE' instead of raising — robust."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_auto_upgrade.py (new)"
+  ],
+  "success_rate": {"backend": "100% (21 passed / 1 skipped — skip is market-dependent, not a failure)", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "N/A — public API, no auth",
+  "seed_data_creation": "Multiple AI signals written to ai_signals MongoDB collection during test runs (intervals: 1h, 1day, 5min, with various engine/auto_upgrade combos). All persisted with new sl_method and auto_upgraded fields populated.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Cache TTLs are 60s for engine=rule and 180s for engine=ai. Cache key format is 'ai:{engine}:au{0|1}:{interval}'. Auto-upgrade only triggers when (auto_upgrade=true AND engine=rule AND rule action in BUY/SELL AND signal_strength in STRONG/VERY_STRONG AND EMERGENT_LLM_KEY present); otherwise auto_upgraded stays False and votes contains a single 'rule' vote. The Dual-LLM ensemble takes 20-50s on cold cache so use timeout >= 90s. TwelveData free tier (8 req/min) occasionally leaks 429 → 500; the test helper _safe_get retries once after 40s. Frontend untested in this iteration.",
+  "rca of the issue": "No bugs found in the targeted features. ATR-based SL/TP, auto-upgrade contract, cache separation, and stats schema all behave as specified. The only carry-over concern is the TwelveData 429-as-500 leak (already documented in iteration_1.json) which is unrelated to the current feature set."
+}

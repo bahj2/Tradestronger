@@ -28,6 +28,8 @@ export default function Dashboard() {
     const [aiError, setAiError] = useState(null);
     const [confidenceThreshold, setConfidenceThreshold] = useState(60);
     const [engine, setEngine] = useState("rule");
+    const [autoUpgrade, setAutoUpgrade] = useState(true);
+    const [strongOnly, setStrongOnly] = useState(false);
 
     const refresh = () => setRefreshKey((k) => k + 1);
 
@@ -36,7 +38,7 @@ export default function Dashboard() {
         setAiLoading(true);
         setAiError(null);
         try {
-            const s = await fetchAISignal(interval, useEngine);
+            const s = await fetchAISignal(interval, useEngine, autoUpgrade);
             setAiSignal(s);
             if (forceEngine) setEngine(forceEngine);
         } catch (e) {
@@ -45,7 +47,7 @@ export default function Dashboard() {
         } finally {
             setAiLoading(false);
         }
-    }, [interval, engine]);
+    }, [interval, engine, autoUpgrade]);
 
     useEffect(() => {
         document.title = "AURUM TERMINAL — XAU/USD Pro Analytics";
@@ -109,7 +111,33 @@ export default function Dashboard() {
                         {tf.label}
                     </button>
                 ))}
-                <div className="ml-auto flex items-center gap-3">
+                <div className="ml-auto flex items-center gap-3 flex-wrap">
+                    <label
+                        className="hidden md:flex items-center gap-1.5 text-[10px] font-mono text-gray-400 uppercase tracking-[0.15em] cursor-pointer select-none"
+                        title="When ON: free Rule Engine watches continuously. If it spots a STRONG/VERY STRONG setup, it auto-upgrades to Dual-AI (Claude+Gemini) for a cross-checked verdict."
+                    >
+                        <input
+                            type="checkbox"
+                            data-testid="auto-upgrade-toggle"
+                            checked={autoUpgrade}
+                            onChange={(e) => setAutoUpgrade(e.target.checked)}
+                            className="accent-[#D4AF37] cursor-pointer"
+                        />
+                        Auto-upgrade to Deep AI
+                    </label>
+                    <label
+                        className="hidden md:flex items-center gap-1.5 text-[10px] font-mono text-gray-400 uppercase tracking-[0.15em] cursor-pointer select-none"
+                        title="Only act on STRONG/VERY STRONG signals. WEAK/MODERATE will be flagged as do-not-trade."
+                    >
+                        <input
+                            type="checkbox"
+                            data-testid="strong-only-toggle"
+                            checked={strongOnly}
+                            onChange={(e) => setStrongOnly(e.target.checked)}
+                            className="accent-[#D4AF37] cursor-pointer"
+                        />
+                        Strong-only
+                    </label>
                     <div className="hidden md:flex items-center gap-2">
                         <label className="text-[10px] font-mono text-gray-500 uppercase tracking-[0.2em]" htmlFor="conf-thresh">
                             Min Confidence
@@ -141,7 +169,12 @@ export default function Dashboard() {
                     <PriceChart
                         interval={interval}
                         refreshKey={refreshKey}
-                        aiSignal={aiSignal && aiSignal.confidence >= confidenceThreshold ? aiSignal : null}
+                        aiSignal={(() => {
+                            if (!aiSignal) return null;
+                            if (aiSignal.confidence < confidenceThreshold) return null;
+                            if (strongOnly && !["STRONG", "VERY_STRONG"].includes(aiSignal.signal_strength)) return null;
+                            return aiSignal;
+                        })()}
                     />
                     <div className="mt-2">
                         <WinRateTracker refreshKey={refreshKey} />
@@ -164,6 +197,7 @@ export default function Dashboard() {
                         onDeepAI={() => loadAI("ai")}
                         engine={engine}
                         confidenceThreshold={confidenceThreshold}
+                        strongOnly={strongOnly}
                     />
                     <NewsFeed />
                 </aside>
