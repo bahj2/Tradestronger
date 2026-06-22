@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import {
     TrendingUp, TrendingDown, Minus, Sparkles, RefreshCw, Loader2,
     Clock, Shield, Newspaper, DollarSign, Layers, Activity,
-    CheckCircle2, AlertTriangle, XCircle, Bot,
+    CheckCircle2, AlertTriangle, XCircle, Bot, Zap,
 } from "lucide-react";
 
 function fmt(n, d = 2) {
@@ -87,7 +87,7 @@ function StepRow({ icon: Icon, title, text, testId }) {
     );
 }
 
-export default function AISignalCard({ signal, loading, error, onRegenerate, confidenceThreshold = 0 }) {
+export default function AISignalCard({ signal, loading, error, onRegenerate, onDeepAI, engine, confidenceThreshold = 0 }) {
     const action = (signal?.action || "HOLD").toUpperCase();
     const style = actionStyle[action] || actionStyle.HOLD;
     const Icon = style.Icon;
@@ -114,19 +114,44 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, con
         >
             <div className="flex items-center justify-between px-4 py-2 border-b border-[#262626]">
                 <div className="flex items-center gap-2">
-                    <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
-                    <span className="text-[10px] font-mono text-[#D4AF37] uppercase tracking-[0.2em]">
-                        Dual-AI Signal · Claude + Gemini
-                    </span>
+                    {engine === "ai" ? (
+                        <>
+                            <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
+                            <span className="text-[10px] font-mono text-[#D4AF37] uppercase tracking-[0.2em]">
+                                Deep AI · Claude + Gemini
+                            </span>
+                        </>
+                    ) : (
+                        <>
+                            <Zap className="w-3.5 h-3.5 text-[#00B86B]" />
+                            <span className="text-[10px] font-mono text-[#00B86B] uppercase tracking-[0.2em]">
+                                Rule Engine · FREE
+                            </span>
+                        </>
+                    )}
                 </div>
-                <button
-                    onClick={onRegenerate}
-                    disabled={loading}
-                    data-testid="regen-ai-btn"
-                    className="text-[10px] font-mono uppercase text-gray-400 hover:text-[#D4AF37] disabled:opacity-50"
-                >
-                    {loading ? <Loader2 className="w-3 h-3 inline animate-spin" /> : <RefreshCw className="w-3 h-3 inline" />}
-                </button>
+                <div className="flex items-center gap-1.5">
+                    {onDeepAI && (
+                        <button
+                            onClick={onDeepAI}
+                            disabled={loading}
+                            data-testid="deep-ai-btn"
+                            title="Run deep multi-AI analysis (costs LLM credits)"
+                            className="text-[10px] font-mono uppercase tracking-[0.1em] px-2 py-1 border border-[#D4AF37]/40 text-[#D4AF37] hover:bg-[#D4AF37]/10 rounded-sm transition-colors disabled:opacity-50 flex items-center gap-1"
+                        >
+                            <Sparkles className="w-3 h-3" />
+                            Deep AI
+                        </button>
+                    )}
+                    <button
+                        onClick={onRegenerate}
+                        disabled={loading}
+                        data-testid="regen-ai-btn"
+                        className="text-[10px] font-mono uppercase text-gray-400 hover:text-[#D4AF37] disabled:opacity-50 p-1"
+                    >
+                        {loading ? <Loader2 className="w-3 h-3 inline animate-spin" /> : <RefreshCw className="w-3 h-3 inline" />}
+                    </button>
+                </div>
             </div>
 
             {error && (

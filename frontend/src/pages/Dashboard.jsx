@@ -27,22 +27,25 @@ export default function Dashboard() {
     const [aiLoading, setAiLoading] = useState(false);
     const [aiError, setAiError] = useState(null);
     const [confidenceThreshold, setConfidenceThreshold] = useState(60);
+    const [engine, setEngine] = useState("rule");
 
     const refresh = () => setRefreshKey((k) => k + 1);
 
-    const loadAI = useCallback(async () => {
+    const loadAI = useCallback(async (forceEngine) => {
+        const useEngine = forceEngine || engine;
         setAiLoading(true);
         setAiError(null);
         try {
-            const s = await fetchAISignal(interval);
+            const s = await fetchAISignal(interval, useEngine);
             setAiSignal(s);
+            if (forceEngine) setEngine(forceEngine);
         } catch (e) {
-            setAiError(e?.response?.data?.detail || e.message || "AI analysis failed");
+            setAiError(e?.response?.data?.detail || e.message || "Analysis failed");
             setAiSignal(null);
         } finally {
             setAiLoading(false);
         }
-    }, [interval]);
+    }, [interval, engine]);
 
     useEffect(() => {
         document.title = "AURUM TERMINAL — XAU/USD Pro Analytics";
@@ -157,7 +160,9 @@ export default function Dashboard() {
                         signal={aiSignal}
                         loading={aiLoading}
                         error={aiError}
-                        onRegenerate={loadAI}
+                        onRegenerate={() => loadAI()}
+                        onDeepAI={() => loadAI("ai")}
+                        engine={engine}
                         confidenceThreshold={confidenceThreshold}
                     />
                     <NewsFeed />

@@ -52,6 +52,86 @@ def _cache_set(key: str, data: Any) -> None:
 TD_BASE = "https://api.twelvedata.com"
 SYMBOL = "XAU/USD"
 
+YAHOO_GOLD_SYMBOL = "GC=F"  # COMEX Gold Futures — closest to XAU/USD spot
+YAHOO_INTERVAL_MAP = {
+    "1min":  ("1m",  "1d"),
+    "5min":  ("5m",  "5d"),
+    "15min": ("15m", "5d"),
+    "1h":    ("60m", "30d"),
+    "4h":    ("60m", "60d"),   # 4h not supported on Yahoo — use 60m candles
+    "1day":  ("1d",  "300d"),
+}
+
+# ------------------- Yahoo Finance fallback -------------------
+async def _yahoo_fetch_chart(symbol: str, interval: str, range_: str) -> dict:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    async with httpx.AsyncClient(
+        timeout=15.0,
+        headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'},
+    ) as http:
+        r = await http.get(url, params={'interval': interval, 'range': range_})
+        r.raise_for_status()
+        data = r.json()
+        if data.get('chart', {}).get('error'):
+            raise HTTPException(status_code=502, detail=str(data['chart']['error']))
+        results = data.get('chart', {}).get('result')
+        if not results:
+            raise HTTPException(status_code=502, detail="Yahoo: no data")
+        return results[0]
+
+
+async def _yahoo_get_quote() -> dict:
+    """Get XAU/USD-equivalent quote via Yahoo Finance (Gold futures GC=F).
+    Returns a dict; caller wraps it in Quote()."""
+    result = await _yahoo_fetch_chart(YAHOO_GOLD_SYMBOL, "1d", "5d")
+    meta = result['meta']
+    price = float(meta['regularMarketPrice'])
+    prev = float(meta.get('chartPreviousClose') or meta.get('previousClose') or price)
+    change = price - prev
+    pct = (change / prev * 100) if prev else 0
+    quotes = (result.get('indicators', {}).get('quote') or [{}])[0]
+    highs = [h for h in (quotes.get('high') or []) if h is not None]
+    lows = [lo for lo in (quotes.get('low') or []) if lo is not None]
+    opens = [o for o in (quotes.get('open') or []) if o is not None]
+    return {
+        "symbol": SYMBOL,
+        "price": price,
+        "change": change,
+        "percent_change": pct,
+        "high": max(highs[-2:]) if highs else price,
+        "low": min(lows[-2:]) if lows else price,
+        "open": opens[-1] if opens else price,
+        "previous_close": prev,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _yahoo_get_candles(interval: str, size: int) -> List[dict]:
+    yi, yr = YAHOO_INTERVAL_MAP.get(interval, ("60m", "30d"))
+    result = await _yahoo_fetch_chart(YAHOO_GOLD_SYMBOL, yi, yr)
+    ts = result.get('timestamp', []) or []
+    q = (result.get('indicators', {}).get('quote') or [{}])[0]
+    opens = q.get('open') or []
+    highs = q.get('high') or []
+    lows  = q.get('low')  or []
+    closes = q.get('close') or []
+    vols  = q.get('volume') or []
+    candles: List[dict] = []
+    for i, t in enumerate(ts):
+        c = closes[i] if i < len(closes) else None
+        if c is None:
+            continue
+        candles.append({
+            'time': int(t),
+            'open': float(opens[i]) if i < len(opens) and opens[i] is not None else float(c),
+            'high': float(highs[i]) if i < len(highs) and highs[i] is not None else float(c),
+            'low':  float(lows[i])  if i < len(lows)  and lows[i]  is not None else float(c),
+            'close': float(c),
+            'volume': float(vols[i]) if i < len(vols) and vols[i] is not None else 0,
+        })
+    return candles[-size:]
+
+
 # ------------------- TwelveData helpers -------------------
 async def td_get(path: str, params: dict) -> dict:
     params = {**params, 'apikey': TWELVEDATA_API_KEY}
@@ -242,24 +322,31 @@ async def get_quote():
         return cache
     try:
         data = await td_get("quote", {"symbol": SYMBOL})
+        q = Quote(
+            symbol=data.get('symbol', SYMBOL),
+            price=float(data['close']),
+            change=float(data.get('change', 0)),
+            percent_change=float(data.get('percent_change', 0)),
+            high=float(data.get('high', data['close'])),
+            low=float(data.get('low', data['close'])),
+            open=float(data.get('open', data['close'])),
+            previous_close=float(data.get('previous_close', data['close'])),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        _cache_set('quote', q.model_dump())
+        return q
     except HTTPException as e:
-        stale = _cache_get_stale('quote')
-        if stale and e.status_code in (429, 502, 503):
-            return stale
+        if e.status_code in (429, 502, 503):
+            try:
+                yq_dict = await _yahoo_get_quote()
+                _cache_set('quote', yq_dict)
+                return Quote(**yq_dict)
+            except Exception as ye:
+                logging.warning(f"Yahoo quote fallback failed: {ye}")
+            stale = _cache_get_stale('quote')
+            if stale:
+                return stale
         raise
-    q = Quote(
-        symbol=data.get('symbol', SYMBOL),
-        price=float(data['close']),
-        change=float(data.get('change', 0)),
-        percent_change=float(data.get('percent_change', 0)),
-        high=float(data.get('high', data['close'])),
-        low=float(data.get('low', data['close'])),
-        open=float(data.get('open', data['close'])),
-        previous_close=float(data.get('previous_close', data['close'])),
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
-    _cache_set('quote', q.model_dump())
-    return q
 
 @api_router.get("/market/candles")
 async def get_candles(interval: str = Query("1h"), size: int = Query(120, ge=20, le=500)):
@@ -267,34 +354,44 @@ async def get_candles(interval: str = Query("1h"), size: int = Query(120, ge=20,
     cache = _cache_get(key, ttl_seconds=30)
     if cache:
         return cache
+    # Try TwelveData first
     try:
         data = await td_get("time_series", {"symbol": SYMBOL, "interval": interval, "outputsize": size})
+        values = data.get('values', [])
+        candles = []
+        for v in reversed(values):
+            try:
+                t = datetime.fromisoformat(v['datetime'].replace(' ', 'T'))
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                candles.append({
+                    'time': int(t.timestamp()),
+                    'open': float(v['open']),
+                    'high': float(v['high']),
+                    'low': float(v['low']),
+                    'close': float(v['close']),
+                    'volume': float(v.get('volume') or 0),
+                })
+            except (KeyError, ValueError):
+                continue
+        result = {'symbol': SYMBOL, 'interval': interval, 'candles': candles}
+        _cache_set(key, result)
+        return result
     except HTTPException as e:
-        stale = _cache_get_stale(key)
-        if stale and e.status_code in (429, 502, 503):
-            return stale
+        # Yahoo Finance fallback
+        if e.status_code in (429, 502, 503):
+            try:
+                ycandles = await _yahoo_get_candles(interval, size)
+                if ycandles:
+                    result = {'symbol': SYMBOL, 'interval': interval, 'candles': ycandles}
+                    _cache_set(key, result)
+                    return result
+            except Exception as ye:
+                logging.warning(f"Yahoo candles fallback failed: {ye}")
+            stale = _cache_get_stale(key)
+            if stale:
+                return stale
         raise
-    values = data.get('values', [])
-    # TwelveData returns latest first; reverse for chronological
-    candles = []
-    for v in reversed(values):
-        try:
-            t = datetime.fromisoformat(v['datetime'].replace(' ', 'T'))
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            candles.append({
-                'time': int(t.timestamp()),
-                'open': float(v['open']),
-                'high': float(v['high']),
-                'low': float(v['low']),
-                'close': float(v['close']),
-                'volume': float(v.get('volume') or 0),
-            })
-        except (KeyError, ValueError):
-            continue
-    result = {'symbol': SYMBOL, 'interval': interval, 'candles': candles}
-    _cache_set(key, result)
-    return result
 
 @api_router.get("/analysis/indicators", response_model=IndicatorSnapshot)
 async def get_indicators(interval: str = Query("1h")):
@@ -524,6 +621,189 @@ def _compute_signal_strength_fallback(confidence: int) -> str:
     return "WEAK"
 
 
+def _rule_engine_analyze(
+    snapshot: IndicatorSnapshot,
+    interval: str,
+    higher_snap: Optional[IndicatorSnapshot],
+    lower_snap: Optional[IndicatorSnapshot],
+    dxy: Optional[Dict[str, float]],
+    news_titles: List[str],
+) -> dict:
+    """Deterministic rule-based analysis. Free, fast, no API calls.
+    Outputs same JSON shape as the LLM analyzers."""
+    score = 0.0
+    factors: List[str] = []
+
+    # Primary EMA stack
+    if snapshot.ema20 and snapshot.ema50:
+        if snapshot.price > snapshot.ema20 > snapshot.ema50:
+            score += 2
+            factors.append("Bullish EMA stack: price > EMA20 > EMA50")
+        elif snapshot.price < snapshot.ema20 < snapshot.ema50:
+            score -= 2
+            factors.append("Bearish EMA stack: price < EMA20 < EMA50")
+
+    # EMA200 (long-term trend)
+    if snapshot.ema200:
+        if snapshot.price > snapshot.ema200:
+            score += 1
+            factors.append("Price above EMA200 (long-term up)")
+        else:
+            score -= 1
+            factors.append("Price below EMA200 (long-term down)")
+
+    # RSI
+    if snapshot.rsi is not None:
+        if snapshot.rsi > 70:
+            score -= 1
+            factors.append(f"RSI {snapshot.rsi:.1f} overbought")
+        elif snapshot.rsi < 30:
+            score += 1
+            factors.append(f"RSI {snapshot.rsi:.1f} oversold")
+        elif snapshot.rsi > 55:
+            score += 0.5
+            factors.append(f"RSI {snapshot.rsi:.1f} bullish bias")
+        elif snapshot.rsi < 45:
+            score -= 0.5
+            factors.append(f"RSI {snapshot.rsi:.1f} bearish bias")
+
+    # MACD
+    if snapshot.macd is not None and snapshot.macd_signal is not None:
+        if snapshot.macd > snapshot.macd_signal:
+            score += 1
+            factors.append("MACD bullish cross")
+        else:
+            score -= 1
+            factors.append("MACD bearish cross")
+
+    # Higher TF
+    higher_trend = _trend_label(higher_snap)
+    if higher_trend == "BULLISH":
+        score += 1
+    elif higher_trend == "BEARISH":
+        score -= 1
+
+    # Lower TF momentum
+    lower_trend = _trend_label(lower_snap)
+    if lower_trend == "BULLISH":
+        score += 0.5
+    elif lower_trend == "BEARISH":
+        score -= 0.5
+
+    # DXY (inverse correlation)
+    if dxy and dxy.get('percent_change') is not None:
+        chg = dxy['percent_change']
+        if chg > 0.3:
+            score -= 1
+            factors.append(f"DXY +{chg:.2f}% strong dollar — bearish gold")
+        elif chg < -0.3:
+            score += 1
+            factors.append(f"DXY {chg:.2f}% weak dollar — bullish gold")
+
+    # Bollinger bands
+    if snapshot.bb_upper and snapshot.bb_lower and snapshot.bb_upper > snapshot.bb_lower:
+        bb_pos = (snapshot.price - snapshot.bb_lower) / (snapshot.bb_upper - snapshot.bb_lower)
+        if bb_pos > 0.9:
+            score -= 0.5
+            factors.append("Near upper Bollinger band — overextended")
+        elif bb_pos < 0.1:
+            score += 0.5
+            factors.append("Near lower Bollinger band — oversold")
+
+    # Decide action
+    if score >= 3:
+        action = "BUY"
+        confidence = min(95, 50 + int(score * 6))
+    elif score <= -3:
+        action = "SELL"
+        confidence = min(95, 50 + int(-score * 6))
+    else:
+        action = "HOLD"
+        confidence = max(30, 50 - int(abs(score) * 4))
+
+    # Strength
+    abs_s = abs(score)
+    if abs_s >= 5:
+        strength = "VERY_STRONG"
+    elif abs_s >= 3.5:
+        strength = "STRONG"
+    elif abs_s >= 2:
+        strength = "MODERATE"
+    else:
+        strength = "WEAK"
+
+    # SL/TP based on timeframe volatility
+    sl_pct = {
+        "1min": 0.005, "5min": 0.008, "15min": 0.012,
+        "1h": 0.018, "4h": 0.028, "1day": 0.045,
+    }.get(interval, 0.018)
+    sl_dist = snapshot.price * sl_pct
+
+    if action == "BUY":
+        entry = snapshot.price
+        sl = round(entry - sl_dist, 2)
+        tp1 = round(entry + sl_dist, 2)
+        tp2 = round(entry + sl_dist * 2, 2)
+        tp3 = round(entry + sl_dist * 3, 2)
+    elif action == "SELL":
+        entry = snapshot.price
+        sl = round(entry + sl_dist, 2)
+        tp1 = round(entry - sl_dist, 2)
+        tp2 = round(entry - sl_dist * 2, 2)
+        tp3 = round(entry - sl_dist * 3, 2)
+    else:
+        entry = snapshot.price
+        sl = round(entry - sl_dist, 2)
+        tp1 = round(entry + sl_dist, 2)
+        tp2 = round(entry + sl_dist * 2, 2)
+        tp3 = round(entry + sl_dist * 3, 2)
+
+    sentiment = "BULLISH" if score > 1 else "BEARISH" if score < -1 else "NEUTRAL"
+
+    summary = (
+        f"{action} {strength.replace('_', ' ').title()} setup. "
+        f"Score {score:+.1f} from {len(factors)} factors."
+    )
+    reasoning = " ".join(factors[:6]) if factors else "Insufficient confluence — staying neutral."
+
+    rsi_str = f"{snapshot.rsi:.1f}" if snapshot.rsi is not None else "n/a"
+    macd_bull = (
+        snapshot.macd is not None and snapshot.macd_signal is not None
+        and snapshot.macd > snapshot.macd_signal
+    )
+    macd_str = "bullish" if macd_bull else "bearish"
+
+    return {
+        "action": action,
+        "confidence": confidence,
+        "signal_strength": strength,
+        "entry": round(entry, 2),
+        "stop_loss": sl,
+        "take_profit": tp1,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "risk_reward": 2.0,
+        "valid_for_minutes": TIMEFRAME_EXPIRY_MIN.get(interval, 720),
+        "sentiment": sentiment,
+        "higher_tf_trend": higher_trend,
+        "lower_tf_momentum": lower_trend,
+        "news_sentiment": "NEUTRAL",
+        "summary": summary,
+        "reasoning": reasoning,
+        "analysis_steps": {
+            "trend": f"Higher TF: {higher_trend} · Primary: {_trend_label(snapshot)} · Lower TF: {lower_trend}",
+            "momentum": f"RSI {rsi_str} · MACD {macd_str} cross",
+            "news": f"Aggregated {len(news_titles)} headlines (rule engine doesn't read text — click Deep AI for that)",
+            "macro": (
+                f"DXY {dxy['price']:.2f} ({dxy['percent_change']:+.2f}%)"
+                if dxy else "DXY unavailable"
+            ),
+            "verdict": (
+                f"Combined factor score {score:+.1f} → {action} with {strength.replace('_', ' ')} strength."
+            ),
+        },
+    }
+
+
 async def _run_single_ai(provider: str, model: str, prompt: str, label: str) -> Optional[dict]:
     """Call one LLM, parse its JSON reply. Returns None on failure."""
     try:
@@ -615,11 +895,12 @@ def _compute_consensus(claude_parsed: Optional[dict], gpt_parsed: Optional[dict]
 
 
 @api_router.get("/analysis/ai", response_model=AISignal)
-async def get_ai_signal(interval: str = Query("1h")):
-    if not EMERGENT_LLM_KEY:
-        raise HTTPException(status_code=500, detail="LLM key not configured")
-    cache_key = f"ai:{interval}"
-    cached = _cache_get(cache_key, ttl_seconds=180)
+async def get_ai_signal(
+    interval: str = Query("1h"),
+    engine: str = Query("rule"),  # "rule" (free, default) or "ai" (dual-LLM)
+):
+    cache_key = f"ai:{engine}:{interval}"
+    cached = _cache_get(cache_key, ttl_seconds=180 if engine == "ai" else 60)
     if cached:
         return cached
 
@@ -627,7 +908,7 @@ async def get_ai_signal(interval: str = Query("1h")):
     snapshot = await get_indicators(interval=interval)
     candles_resp = await get_candles(interval=interval, size=120)
 
-    # Multi-TF context (best-effort)
+    # Multi-TF context
     higher_tf = TIMEFRAME_HIERARCHY.get(interval, ("4h", "1day"))[0]
     lower_tf_map = {
         "1min": "1min", "5min": "1min", "15min": "5min",
@@ -642,26 +923,35 @@ async def get_ai_signal(interval: str = Query("1h")):
     news_titles = await _safe_news_titles(limit=10)
     news_items = await _safe_news_items(limit=8)
 
-    prompt = _build_strong_prompt(
-        snapshot=snapshot,
-        interval=interval,
-        recent_candles=candles_resp['candles'],
-        higher_snap=higher_snap,
-        lower_snap=lower_snap,
-        higher_tf=higher_tf,
-        lower_tf=lower_tf,
-        dxy=dxy,
-        news_titles=news_titles,
-    )
+    # ===== Branch on engine =====
+    if engine == "rule":
+        parsed = _rule_engine_analyze(snapshot, interval, higher_snap, lower_snap, dxy, news_titles)
+        votes = [AIVote(
+            model="AURUM Rule Engine",
+            model_id="rule",
+            action=parsed["action"],
+            confidence=parsed["confidence"],
+            summary=parsed["summary"],
+            available=True,
+        )]
+        consensus = "SINGLE_SOURCE"
+    else:
+        if not EMERGENT_LLM_KEY:
+            raise HTTPException(status_code=500, detail="LLM key not configured")
+        prompt = _build_strong_prompt(
+            snapshot=snapshot, interval=interval,
+            recent_candles=candles_resp['candles'],
+            higher_snap=higher_snap, lower_snap=lower_snap,
+            higher_tf=higher_tf, lower_tf=lower_tf,
+            dxy=dxy, news_titles=news_titles,
+        )
+        claude_task = _run_single_ai("anthropic", "claude-sonnet-4-5-20250929", prompt, "claude")
+        gpt_task = _run_single_ai("gemini", "gemini-3.1-pro-preview", prompt, "gemini")
+        claude_parsed, gpt_parsed = await asyncio.gather(claude_task, gpt_task)
 
-    # Run Claude + Gemini in PARALLEL
-    claude_task = _run_single_ai("anthropic", "claude-sonnet-4-5-20250929", prompt, "claude")
-    gpt_task = _run_single_ai("gemini", "gemini-3.1-pro-preview", prompt, "gemini")
-    claude_parsed, gpt_parsed = await asyncio.gather(claude_task, gpt_task)
-
-    consensus, parsed, votes = _compute_consensus(claude_parsed, gpt_parsed)
-    if consensus == "FAILED" or not parsed:
-        raise HTTPException(status_code=502, detail="Both AI models failed to respond")
+        consensus, parsed, votes = _compute_consensus(claude_parsed, gpt_parsed)
+        if consensus == "FAILED" or not parsed:
+            raise HTTPException(status_code=502, detail="Both AI models failed to respond")
 
     def _opt_float(key):
         v = parsed.get(key)
@@ -732,11 +1022,9 @@ async def get_ai_signal(interval: str = Query("1h")):
         news_sources=[{'title': i.get('title', ''), 'source': i.get('source', ''), 'link': i.get('link', '')} for i in news_items],
     )
 
-    # Persist
     await db.ai_signals.insert_one(signal.model_dump())
     payload = signal.model_dump()
     _cache_set(cache_key, payload)
-    # Fire-and-forget Telegram alert (won't block response)
     asyncio.create_task(_maybe_send_signal_alert(signal))
     return payload
 
