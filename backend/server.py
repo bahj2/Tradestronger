@@ -41,6 +41,10 @@ def _cache_get(key: str, ttl_seconds: int) -> Optional[Any]:
         return None
     return entry['data']
 
+def _cache_get_stale(key: str) -> Optional[Any]:
+    entry = _cache.get(key)
+    return entry['data'] if entry else None
+
 def _cache_set(key: str, data: Any) -> None:
     _cache[key] = {'ts': datetime.now(timezone.utc), 'data': data}
 
@@ -51,10 +55,21 @@ SYMBOL = "XAU/USD"
 async def td_get(path: str, params: dict) -> dict:
     params = {**params, 'apikey': TWELVEDATA_API_KEY}
     async with httpx.AsyncClient(timeout=15.0) as http:
-        r = await http.get(f"{TD_BASE}/{path}", params=params)
-        r.raise_for_status()
+        try:
+            r = await http.get(f"{TD_BASE}/{path}", params=params)
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status == 429:
+                raise HTTPException(status_code=429, detail="Market data rate-limited. Try again in a moment.")
+            raise HTTPException(status_code=502, detail=f"Market data HTTP {status}")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=503, detail=f"Market data unavailable: {str(e)[:120]}")
         data = r.json()
         if isinstance(data, dict) and data.get('status') == 'error':
+            code = data.get('code', 502)
+            if code == 429:
+                raise HTTPException(status_code=429, detail="Market data rate-limited. Try again in a moment.")
             raise HTTPException(status_code=502, detail=f"Market data error: {data.get('message', 'unknown')}")
         return data
 
@@ -197,7 +212,13 @@ async def get_quote():
     cache = _cache_get('quote', ttl_seconds=15)
     if cache:
         return cache
-    data = await td_get("quote", {"symbol": SYMBOL})
+    try:
+        data = await td_get("quote", {"symbol": SYMBOL})
+    except HTTPException as e:
+        stale = _cache_get_stale('quote')
+        if stale and e.status_code in (429, 502, 503):
+            return stale
+        raise
     q = Quote(
         symbol=data.get('symbol', SYMBOL),
         price=float(data['close']),
@@ -218,7 +239,13 @@ async def get_candles(interval: str = Query("1h"), size: int = Query(120, ge=20,
     cache = _cache_get(key, ttl_seconds=30)
     if cache:
         return cache
-    data = await td_get("time_series", {"symbol": SYMBOL, "interval": interval, "outputsize": size})
+    try:
+        data = await td_get("time_series", {"symbol": SYMBOL, "interval": interval, "outputsize": size})
+    except HTTPException as e:
+        stale = _cache_get_stale(key)
+        if stale and e.status_code in (429, 502, 503):
+            return stale
+        raise
     values = data.get('values', [])
     # TwelveData returns latest first; reverse for chronological
     candles = []
