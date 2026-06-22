@@ -35,6 +35,9 @@ input group "=== Scale-out Strategy ==="
 input bool   InpUseScaleOut  = true;                                       // At TP1: close 50%, move SL to BE
 input double InpScaleOutPct  = 50.0;                                       // % to close at TP1 (default 50%)
 
+input group "=== Telegram Reporting ==="
+input bool   InpReportToAurum = true;                                      // Send trade events to AURUM Telegram
+
 //--- Globals
 CTrade trade;
 string last_signal_id = "";
@@ -196,11 +199,20 @@ void PollAndTrade()
       ok = trade.Sell(lot_size, InpSymbol, 0, sl, final_tp, comment);
 
    if(ok)
+   {
+      ulong opened_ticket = trade.ResultOrder();
+      double opened_price = trade.ResultPrice();
       Print("Order placed: ", action, " ", lot_size, " ", InpSymbol,
-            " · ticket=", trade.ResultOrder(), " · signal=", sig_id);
+            " · ticket=", opened_ticket, " · signal=", sig_id);
+      ReportToAurum("OPENED", sig_id, opened_ticket, action,
+                    lot_size, opened_price, sl, final_tp, 0.0, "");
+   }
    else
-      Print("Order FAILED: ", trade.ResultRetcode(), " - ",
-            trade.ResultRetcodeDescription(), " · signal=", sig_id);
+   {
+      string err = trade.ResultRetcodeDescription();
+      Print("Order FAILED: ", trade.ResultRetcode(), " - ", err, " · signal=", sig_id);
+      ReportToAurum("ERROR", sig_id, 0, action, lot_size, 0, sl, final_tp, 0.0, err);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -249,16 +261,28 @@ void ManageOpenPositions()
       double close_vol = NormalizeVolume(cur_vol * (InpScaleOutPct / 100.0));
       double remaining = cur_vol - close_vol;
       double vol_min = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
+      double current_tp = PositionGetDouble(POSITION_TP);
       if(close_vol >= vol_min && remaining >= vol_min)
       {
          if(trade.PositionClosePartial(ticket, close_vol))
+         {
             Print("Scaled out ", close_vol, " lots at TP1 on ticket ", ticket);
+            double locked = (ptype == POSITION_TYPE_BUY) ? (tp1 - entry) : (entry - tp1);
+            double tick_value = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_VALUE);
+            double tick_size  = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
+            double profit_est = (tick_size > 0) ? (locked / tick_size) * tick_value * close_vol : 0;
+            string side = (ptype == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+            ReportToAurum("SCALED_OUT", "", ticket, side, close_vol, tp1, sl, current_tp, profit_est, "");
+         }
       }
 
       // Move SL to entry (breakeven). Keep current TP (which is TP3).
-      double current_tp = PositionGetDouble(POSITION_TP);
       if(trade.PositionModify(ticket, entry, current_tp))
+      {
          Print("SL moved to breakeven on ticket ", ticket);
+         string side = (ptype == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+         ReportToAurum("MOVED_BE", "", ticket, side, 0, entry, entry, current_tp, 0, "");
+      }
    }
 }
 
@@ -364,5 +388,76 @@ double ParseCommentNum(string comment, string tag)
    int sep = StringFind(rest, "|");
    if(sep >= 0) rest = StringSubstr(rest, 0, sep);
    return StringToDouble(rest);
+}
+
+//+------------------------------------------------------------------+
+//| Report event to AURUM backend (which forwards to Telegram)       |
+//+------------------------------------------------------------------+
+void ReportToAurum(string event_type, string sig_id, ulong ticket,
+                   string action, double lot, double price,
+                   double sl, double tp, double profit, string note)
+{
+   if(!InpReportToAurum) return;
+   if(InpApiUrl == "") return;
+
+   string url = InpApiUrl + "/api/ea/event";
+   string body = StringFormat(
+      "{\"event\":\"%s\",\"signal_id\":\"%s\",\"ticket\":%d,\"symbol\":\"%s\",\"action\":\"%s\",\"lot\":%.2f,\"price\":%.2f,\"sl\":%.2f,\"tp\":%.2f,\"profit\":%.2f,\"note\":\"%s\"}",
+      event_type, sig_id, (int)ticket, InpSymbol, action, lot, price, sl, tp, profit, note);
+
+   char post[];
+   StringToCharArray(body, post, 0, StringLen(body), CP_UTF8);
+   // Trim trailing null
+   int len = ArraySize(post);
+   if(len > 0 && post[len - 1] == 0)
+      ArrayResize(post, len - 1);
+
+   char result[];
+   string headers;
+   string req_headers = "Content-Type: application/json\r\n";
+   ResetLastError();
+   int code = WebRequest("POST", url, req_headers, 10000, post, result, headers);
+   if(code != 200)
+      Print("ReportToAurum (", event_type, ") failed: HTTP ", code, " err=", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| OnTradeTransaction: detect position closures and report P/L     |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   if(!HistoryDealSelect(trans.deal)) return;
+
+   long magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   if(magic != InpMagicNumber) return;
+
+   long entry_type = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry_type != DEAL_ENTRY_OUT) return; // only full/partial exits
+
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                 + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                 + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   double price  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   ulong pos_id  = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   double vol    = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+
+   // Skip partial closes (those are SCALED_OUT, already reported)
+   bool is_full_close = !PositionSelectByTicket(pos_id);
+   if(!is_full_close) return;
+
+   string comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+   string sig_id = "";
+   int p1 = StringFind(comment, "AURUM|");
+   if(p1 >= 0)
+   {
+      string rest = StringSubstr(comment, p1 + 6);
+      int p2 = StringFind(rest, "|");
+      sig_id = (p2 > 0) ? StringSubstr(rest, 0, p2) : rest;
+   }
+
+   ReportToAurum("CLOSED", sig_id, pos_id, "", vol, price, 0, 0, profit, "");
 }
 //+------------------------------------------------------------------+

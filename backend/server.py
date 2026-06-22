@@ -747,6 +747,83 @@ async def signal_history(limit: int = Query(20, le=100)):
 
 
 # ------------------- MT5 EA endpoints -------------------
+class EAEvent(BaseModel):
+    event: str  # OPENED / SCALED_OUT / MOVED_BE / CLOSED / ERROR
+    signal_id: Optional[str] = ""
+    ticket: Optional[int] = 0
+    symbol: Optional[str] = "XAUUSD"
+    action: Optional[str] = ""  # BUY / SELL
+    lot: Optional[float] = 0
+    price: Optional[float] = 0
+    sl: Optional[float] = 0
+    tp: Optional[float] = 0
+    profit: Optional[float] = 0
+    note: Optional[str] = ""
+
+
+def _format_ea_event_message(e: EAEvent) -> str:
+    sym = e.symbol or "XAUUSD"
+    if e.event == "OPENED":
+        action_emoji = "🟢" if e.action == "BUY" else "🔴"
+        return (
+            f"🤖 <b>EA · Trade OPENED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{action_emoji} <b>{e.action} {sym}</b>\n"
+            f"📦 Lot: <b>{e.lot:.2f}</b>\n"
+            f"💰 Entry: <code>{e.price:.2f}</code>\n"
+            f"🛑 SL: <code>{e.sl:.2f}</code>\n"
+            f"🎯 TP: <code>{e.tp:.2f}</code>\n"
+            f"🎟 Ticket: #{e.ticket}"
+        )
+    if e.event == "SCALED_OUT":
+        return (
+            f"💰 <b>EA · TP1 Hit — Scaled Out 50%</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 Closed {e.lot:.2f} lots at <code>{e.price:.2f}</code>\n"
+            f"💵 Locked profit: <b>${e.profit:+.2f}</b>\n"
+            f"🎟 Ticket: #{e.ticket}"
+        )
+    if e.event == "MOVED_BE":
+        return (
+            f"🛡️ <b>EA · SL → Breakeven</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Position is now <b>risk-free</b>. Runner letting ride to TP3 🎯\n"
+            f"🎟 Ticket: #{e.ticket}"
+        )
+    if e.event == "CLOSED":
+        win = (e.profit or 0) >= 0
+        emoji = "✅" if win else "❌"
+        sign = "+" if win else ""
+        return (
+            f"{emoji} <b>EA · Position CLOSED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🎟 Ticket: #{e.ticket}\n"
+            f"💱 Close price: <code>{e.price:.2f}</code>\n"
+            f"💵 P/L: <b>{sign}${e.profit:.2f}</b>"
+        )
+    if e.event == "ERROR":
+        return (
+            f"⚠️ <b>EA · Error</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{e.note or 'Unknown error'}"
+        )
+    return f"📢 EA event: {e.event}"
+
+
+@api_router.post("/ea/event")
+async def ea_event(event: EAEvent):
+    """Receive trade events from the EA and forward to Telegram."""
+    await db.ea_events.insert_one({
+        **event.model_dump(),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    })
+    cfg = await _get_telegram_config()
+    if cfg.enabled and cfg.bot_token and cfg.chat_id:
+        text = _format_ea_event_message(event)
+        await _send_telegram(text)
+    return {"ok": True}
+
+
 @api_router.get("/ea/signal")
 async def ea_latest_signal(
     last_id: Optional[str] = Query(None),
