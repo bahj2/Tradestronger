@@ -3,14 +3,16 @@ import {
     Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Bot, Download, Copy, ExternalLink, Check, AlertTriangle, Shield } from "lucide-react";
+import { Bot, Download, Copy, ExternalLink, Check, AlertTriangle, Shield, Send, Loader2 } from "lucide-react";
 import { toast } from "sonner";
+import { sendEAToTelegram } from "@/lib/api";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 
 export default function EASettings() {
     const [open, setOpen] = useState(false);
     const [copied, setCopied] = useState(false);
+    const [sendingToTg, setSendingToTg] = useState(false);
 
     const apiUrl = BACKEND_URL;
     const downloadUrl = `${BACKEND_URL}/api/ea/download`;
@@ -23,6 +25,23 @@ export default function EASettings() {
             setTimeout(() => setCopied(false), 2000);
         } catch {
             toast.error("Copy failed — select and copy manually");
+        }
+    };
+
+    const handleSendToTelegram = async () => {
+        setSendingToTg(true);
+        try {
+            await sendEAToTelegram();
+            toast.success("EA file sent to your Telegram!");
+        } catch (e) {
+            const detail = e?.response?.data?.detail || "Send failed";
+            if (detail.includes("not configured")) {
+                toast.error("Set up Telegram first (Alerts button)");
+            } else {
+                toast.error(detail);
+            }
+        } finally {
+            setSendingToTg(false);
         }
     };
 
@@ -71,17 +90,31 @@ export default function EASettings() {
                     {/* Download */}
                     <div className="bg-[#1A1A1A] border border-[#262626] p-3 rounded-sm space-y-2">
                         <div className="text-[10px] font-mono text-[#D4AF37] uppercase tracking-[0.2em]">
-                            Step 1 · Download the EA
+                            Step 1 · Get the EA File
                         </div>
-                        <a
-                            href={downloadUrl}
-                            download="AurumXAUUSD.mq5"
-                            data-testid="download-ea-btn"
-                            className="inline-flex items-center gap-2 px-4 py-2 bg-[#D4AF37] hover:bg-[#C09F2C] text-black font-mono uppercase tracking-wider text-sm font-bold rounded-sm transition-colors"
-                        >
-                            <Download className="w-4 h-4" />
-                            Download AurumXAUUSD.mq5
-                        </a>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <a
+                                href={downloadUrl}
+                                download="AurumXAUUSD.mq5"
+                                data-testid="download-ea-btn"
+                                className="inline-flex items-center gap-2 px-4 py-2 bg-[#D4AF37] hover:bg-[#C09F2C] text-black font-mono uppercase tracking-wider text-sm font-bold rounded-sm transition-colors"
+                            >
+                                <Download className="w-4 h-4" />
+                                Download .mq5
+                            </a>
+                            <button
+                                onClick={handleSendToTelegram}
+                                disabled={sendingToTg}
+                                data-testid="send-ea-telegram-btn"
+                                className="inline-flex items-center gap-2 px-4 py-2 border border-[#3B82F6] text-[#3B82F6] hover:bg-[#3B82F6]/10 font-mono uppercase tracking-wider text-sm font-bold rounded-sm transition-colors disabled:opacity-50"
+                            >
+                                {sendingToTg ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                                Send to Telegram
+                            </button>
+                        </div>
+                        <p className="text-[10px] font-mono text-gray-500 mt-1">
+                            Tip: "Send to Telegram" pushes the file to your phone — then forward it to your PC.
+                        </p>
                     </div>
 
                     {/* API URL */}

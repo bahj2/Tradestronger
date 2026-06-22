@@ -19,3 +19,4 @@ export const fetchNews = (limit = 12) =>
 export const fetchTelegramConfig = () => api.get("/telegram/config").then(r => r.data);
 export const updateTelegramConfig = (payload) => api.post("/telegram/config", payload).then(r => r.data);
 export const sendTelegramTest = () => api.post("/telegram/test").then(r => r.data);
+export const sendEAToTelegram = () => api.post("/telegram/send-ea").then(r => r.data);

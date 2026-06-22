@@ -1167,6 +1167,53 @@ async def telegram_send_test():
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error", "Send failed"))
     return result
+
+
+@api_router.post("/telegram/send-ea")
+async def telegram_send_ea():
+    """Send the MT5 EA file to the configured Telegram chat."""
+    cfg = await _get_telegram_config()
+    if not cfg.bot_token or not cfg.chat_id:
+        raise HTTPException(status_code=400, detail="Telegram not configured")
+    path = Path(__file__).parent / "static" / "AurumXAUUSD.mq5"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="EA file not found")
+
+    caption = (
+        "🤖 <b>AURUM Terminal · MT5 Expert Advisor</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "<b>How to install:</b>\n"
+        "1. Open MT5 on your PC\n"
+        "2. <code>File → Open Data Folder → MQL5 → Experts</code>\n"
+        "3. Drop this <code>.mq5</code> file there\n"
+        "4. In MT5: Navigator → right-click Experts → <b>Refresh</b>\n"
+        "5. Double-click <b>AurumXAUUSD</b> → set <code>InpApiUrl</code>\n"
+        "6. ✅ Tick <b>Allow Algo Trading</b> → OK\n\n"
+        "⚠️ Don't forget to whitelist the API URL in "
+        "<code>Tools → Options → Expert Advisors → Allow WebRequest</code>\n\n"
+        "<i>Test on demo first!</i>"
+    )
+
+    file_bytes = path.read_bytes()
+    url = f"https://api.telegram.org/bot{cfg.bot_token}/sendDocument"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            files = {
+                'document': ('AurumXAUUSD.mq5', file_bytes, 'application/octet-stream'),
+            }
+            data = {
+                'chat_id': cfg.chat_id,
+                'caption': caption,
+                'parse_mode': 'HTML',
+            }
+            r = await http.post(url, data=data, files=files)
+            result = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Telegram send failed: {str(e)[:200]}")
+
+    if not result.get('ok'):
+        raise HTTPException(status_code=502, detail=result.get('description', 'Send failed'))
+    return {"ok": True, "message_id": result['result']['message_id']}
 NEWS_QUERIES = [
     ("Gold Market", "gold+price+XAUUSD+OR+%22gold+market%22"),
     ("Fed / FOMC", "federal+reserve+OR+FOMC+rate+gold"),
