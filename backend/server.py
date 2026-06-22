@@ -349,6 +349,31 @@ async def _safe_dxy() -> Optional[Dict[str, float]]:
     cached = _cache_get('dxy', ttl_seconds=300)
     if cached:
         return cached
+    # Primary: Yahoo Finance (free, no key needed)
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB"
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+        ) as http:
+            r = await http.get(url, params={'interval': '1d', 'range': '5d'})
+            r.raise_for_status()
+            data = r.json()
+            result = data['chart']['result'][0]
+            meta = result['meta']
+            price = float(meta['regularMarketPrice'])
+            prev = float(
+                meta.get('chartPreviousClose')
+                or meta.get('previousClose')
+                or price
+            )
+            pct = ((price - prev) / prev * 100) if prev else 0.0
+            dxy = {'price': price, 'percent_change': pct}
+            _cache_set('dxy', dxy)
+            return dxy
+    except Exception as e:
+        logging.warning(f"Yahoo DXY fetch failed: {e}")
+    # Fallback: TwelveData (often restricted on free tier)
     try:
         data = await td_get("quote", {"symbol": "DXY"})
         dxy = {
