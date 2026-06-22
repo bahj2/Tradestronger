@@ -1,0 +1,40 @@
+{
+  "summary": "End-to-end backend + frontend testing of the AURUM TERMINAL XAU/USD dashboard. All 8 backend pytest tests pass (quote, candles, indicators, AI signal, signal history persistence, news, health, validation). Frontend dashboard loads with live data, all testids resolve, AI signal generates with BUY/72% confidence/entry/SL/TP/summary/reasoning, indicators populated, signal history table renders rows, news feed renders items, and timeframe switching works (verified 5m switch updated chart). Encountered TwelveData 429 rate limit on first attempt (free tier 8 req/min) — backend bubbles this up as raw 500 with no graceful handling; retried after 75s and all endpoints returned 200.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/market/quote, /api/market/candles, /api/analysis/indicators, /api/analysis/ai", "issue": "When TwelveData returns 429 (rate-limited, free tier = 8 req/min), httpx.raise_for_status() raises uncaught HTTPStatusError which surfaces as HTTP 500 to the client instead of a meaningful 429/503 or a stale-cache fallback. Frontend will show blank panels during quota windows."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_xauusd_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Low priority) Wrap TwelveData calls (td_get) in try/except for httpx.HTTPStatusError: on 429, either return last cached value (stale-if-error) or raise HTTPException(status_code=429, detail='Market data temporarily rate-limited'). This will improve UX during quota windows.",
+    "(Optional) Increase cache TTLs slightly (quote 20-30s, candles 60s) to lower hit rate on TwelveData free tier."
+  ],
+  "critical_code_review_comments": [
+    "server.py td_get() does not handle non-2xx responses gracefully; raise_for_status() leaks HTTPStatusError → 500. Catch and translate to proper HTTP errors or fallback to stale cache.",
+    "MongoDB _id correctly excluded from /api/signals/history projection — good.",
+    "AI JSON parsing is robust (handles ``` fences, finds outer braces) — good.",
+    "All caches are in-process dicts; OK for single-worker uvicorn but won't scale to multi-worker.",
+    "load_dotenv at top of server.py before reading env — correct order.",
+    "Pydantic models validate response shapes — good."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_xauusd_api.py (new)"
+  ],
+  "success_rate": {"backend": "100% (8/8 pytest tests)", "frontend": "100% (all data-testids resolved, chart + AI + indicators + history + news all populated, timeframe switching works)"},
+  "test_credentials": "N/A — public dashboard, no auth",
+  "seed_data_creation": "AI signal endpoint call seeded ai_signals collection in MongoDB (verified via /api/signals/history returning 6+ entries).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend uses TwelveData free tier (8 req/min). If tests fail with HTTP 500, wait ~60-75s and retry — quota refresh fixes it. The AI endpoint is cached 120s per timeframe and the first call takes 5-10s. All data-testid attributes confirmed working: app-title, ticker-bar, ticker-symbol, ticker-price, timeframe-{1min|5min|15min|1h|4h|1day}-btn, refresh-btn, price-chart, ai-signal-card, ai-action-display, ai-entry, ai-sl, ai-tp, ai-summary, ai-reasoning, indicators-panel, ind-macd, ind-ema20, signal-history, news-feed, news-item-0.",
+  "rca of the issue": "First test run failed with 500s on quote/candles/indicators/ai because the dashboard was actively polling (TickerBar 20s, plus chart/indicators/AI on load) and used up TwelveData's 8 req/min budget while pytest started. Backend's td_get() calls r.raise_for_status() on the 429, which propagates as an unhandled HTTPStatusError → FastAPI returns 500. After waiting ~75 seconds for quota reset, all 8 tests pass cleanly. Recommended mitigation: catch HTTPStatusError and return cached/stale data with a Warning header, or translate to 429 with Retry-After."
+}
