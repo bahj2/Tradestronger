@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import TickerBar from "@/components/TickerBar";
 import PriceChart from "@/components/PriceChart";
 import AISignalCard from "@/components/AISignalCard";
@@ -6,6 +6,7 @@ import IndicatorsPanel from "@/components/IndicatorsPanel";
 import NewsFeed from "@/components/NewsFeed";
 import SignalHistory from "@/components/SignalHistory";
 import { Activity } from "lucide-react";
+import { fetchAISignal } from "@/lib/api";
 
 const TIMEFRAMES = [
     { id: "1min", label: "1m" },
@@ -17,14 +18,34 @@ const TIMEFRAMES = [
 ];
 
 export default function Dashboard() {
-    const [interval, setInterval] = useState("1h");
+    const [interval, setInterval] = useState("15min");
     const [refreshKey, setRefreshKey] = useState(0);
+    const [aiSignal, setAiSignal] = useState(null);
+    const [aiLoading, setAiLoading] = useState(false);
+    const [aiError, setAiError] = useState(null);
+    const [confidenceThreshold, setConfidenceThreshold] = useState(60);
 
     const refresh = () => setRefreshKey((k) => k + 1);
+
+    const loadAI = useCallback(async () => {
+        setAiLoading(true);
+        setAiError(null);
+        try {
+            const s = await fetchAISignal(interval);
+            setAiSignal(s);
+        } catch (e) {
+            setAiError(e?.response?.data?.detail || e.message || "AI analysis failed");
+            setAiSignal(null);
+        } finally {
+            setAiLoading(false);
+        }
+    }, [interval]);
 
     useEffect(() => {
         document.title = "AURUM TERMINAL — XAU/USD Pro Analytics";
     }, []);
+
+    useEffect(() => { loadAI(); }, [loadAI, refreshKey]);
 
     return (
         <div className="min-h-screen bg-[#0A0A0A] text-white">
@@ -80,15 +101,40 @@ export default function Dashboard() {
                         {tf.label}
                     </button>
                 ))}
-                <div className="ml-auto text-[10px] font-mono text-gray-600 uppercase tracking-[0.2em]">
-                    Selected · <span className="text-[#D4AF37]">{interval}</span>
+                <div className="ml-auto flex items-center gap-3">
+                    <div className="hidden md:flex items-center gap-2">
+                        <label className="text-[10px] font-mono text-gray-500 uppercase tracking-[0.2em]" htmlFor="conf-thresh">
+                            Min Confidence
+                        </label>
+                        <input
+                            id="conf-thresh"
+                            data-testid="confidence-threshold-slider"
+                            type="range"
+                            min={0}
+                            max={95}
+                            step={5}
+                            value={confidenceThreshold}
+                            onChange={(e) => setConfidenceThreshold(parseInt(e.target.value, 10))}
+                            className="w-28 accent-[#D4AF37]"
+                        />
+                        <span className="text-xs font-mono text-[#D4AF37] w-10" data-testid="confidence-threshold-value">
+                            {confidenceThreshold}%
+                        </span>
+                    </div>
+                    <div className="text-[10px] font-mono text-gray-600 uppercase tracking-[0.2em]">
+                        Selected · <span className="text-[#D4AF37]">{interval}</span>
+                    </div>
                 </div>
             </div>
 
             {/* Main grid */}
             <main className="p-2 grid grid-cols-12 gap-2">
                 <section className="col-span-12 xl:col-span-9">
-                    <PriceChart interval={interval} refreshKey={refreshKey} />
+                    <PriceChart
+                        interval={interval}
+                        refreshKey={refreshKey}
+                        aiSignal={aiSignal && aiSignal.confidence >= confidenceThreshold ? aiSignal : null}
+                    />
                     <div className="mt-2 grid grid-cols-12 gap-2">
                         <div className="col-span-12 lg:col-span-7">
                             <IndicatorsPanel interval={interval} refreshKey={refreshKey} />
@@ -99,7 +145,13 @@ export default function Dashboard() {
                     </div>
                 </section>
                 <aside className="col-span-12 xl:col-span-3 space-y-2">
-                    <AISignalCard interval={interval} refreshKey={refreshKey} />
+                    <AISignalCard
+                        signal={aiSignal}
+                        loading={aiLoading}
+                        error={aiError}
+                        onRegenerate={loadAI}
+                        confidenceThreshold={confidenceThreshold}
+                    />
                     <NewsFeed />
                 </aside>
             </main>

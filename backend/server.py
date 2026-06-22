@@ -195,12 +195,26 @@ class AISignal(BaseModel):
     entry: float
     stop_loss: float
     take_profit: float
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
     timeframe: str
     reasoning: str
     summary: str
     sentiment: str  # BULLISH / BEARISH / NEUTRAL
     indicators: Dict[str, Optional[float]]
     created_at: str
+    # Strong-analysis extensions
+    signal_strength: Optional[str] = None  # WEAK / MODERATE / STRONG / VERY_STRONG
+    valid_for_minutes: Optional[int] = None
+    expires_at: Optional[str] = None
+    risk_reward: Optional[float] = None
+    higher_tf_trend: Optional[str] = None
+    lower_tf_momentum: Optional[str] = None
+    news_sentiment: Optional[str] = None
+    dxy_price: Optional[float] = None
+    dxy_change_pct: Optional[float] = None
+    analysis_steps: Optional[Dict[str, str]] = None
 
 # ------------------- Routes -------------------
 @api_router.get("/")
@@ -294,58 +308,224 @@ async def get_indicators(interval: str = Query("1h")):
         price=closes[-1],
     )
 
-def _build_ai_prompt(snapshot: IndicatorSnapshot, interval: str, recent_candles: List[dict]) -> str:
+TIMEFRAME_HIERARCHY = {
+    "1min": ("5min", "15min"),
+    "5min": ("15min", "1h"),
+    "15min": ("1h", "4h"),
+    "1h": ("4h", "1day"),
+    "4h": ("1day", "1week"),
+    "1day": ("1week", "1month"),
+}
+
+TIMEFRAME_EXPIRY_MIN = {
+    "1min": 30,
+    "5min": 120,
+    "15min": 360,
+    "1h": 720,
+    "4h": 2880,
+    "1day": 10080,
+}
+
+async def _safe_indicators(interval: str) -> Optional[IndicatorSnapshot]:
+    try:
+        return await get_indicators(interval=interval)
+    except Exception:
+        return None
+
+async def _safe_dxy() -> Optional[Dict[str, float]]:
+    cached = _cache_get('dxy', ttl_seconds=300)
+    if cached:
+        return cached
+    try:
+        data = await td_get("quote", {"symbol": "DXY"})
+        dxy = {
+            'price': float(data['close']),
+            'percent_change': float(data.get('percent_change', 0)),
+        }
+        _cache_set('dxy', dxy)
+        return dxy
+    except Exception:
+        return None
+
+async def _safe_news_titles(limit: int = 8) -> List[str]:
+    try:
+        result = await get_news(limit=limit)
+        return [item.get('title', '') for item in result.get('items', []) if item.get('title')]
+    except Exception:
+        return []
+
+def _trend_label(snap: Optional[IndicatorSnapshot]) -> str:
+    if not snap or snap.ema20 is None or snap.ema50 is None:
+        return "UNKNOWN"
+    if snap.price > snap.ema20 > snap.ema50:
+        return "BULLISH"
+    if snap.price < snap.ema20 < snap.ema50:
+        return "BEARISH"
+    return "MIXED"
+
+def _build_strong_prompt(
+    snapshot: IndicatorSnapshot,
+    interval: str,
+    recent_candles: List[dict],
+    higher_snap: Optional[IndicatorSnapshot],
+    lower_snap: Optional[IndicatorSnapshot],
+    higher_tf: str,
+    lower_tf: str,
+    dxy: Optional[Dict[str, float]],
+    news_titles: List[str],
+) -> str:
+    def f(v):
+        return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
+
     last10 = recent_candles[-10:]
     candle_str = "\n".join(
         f"  {c['open']:.2f} O / {c['high']:.2f} H / {c['low']:.2f} L / {c['close']:.2f} C"
         for c in last10
     )
-    def f(v):
-        return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
-    return f"""You are a senior FX & commodities analyst. Analyze XAU/USD (Gold) on the {interval} timeframe and produce a trade signal.
 
-Current price: {snapshot.price:.2f}
+    def tf_block(label, snap):
+        if not snap:
+            return f"  [{label}]: unavailable"
+        return (
+            f"  [{label}] price {snap.price:.2f} | EMA20 {f(snap.ema20)} | "
+            f"EMA50 {f(snap.ema50)} | EMA200 {f(snap.ema200)} | RSI {f(snap.rsi)} | "
+            f"MACD {f(snap.macd)} (sig {f(snap.macd_signal)}) | trend {_trend_label(snap)}"
+        )
 
-Technical snapshot:
-- RSI(14): {f(snapshot.rsi)}
-- MACD: {f(snapshot.macd)} | Signal: {f(snapshot.macd_signal)} | Hist: {f(snapshot.macd_hist)}
-- EMA20: {f(snapshot.ema20)} | EMA50: {f(snapshot.ema50)} | EMA200: {f(snapshot.ema200)}
-- Bollinger: upper {f(snapshot.bb_upper)}, mid {f(snapshot.bb_mid)}, lower {f(snapshot.bb_lower)}
+    mtf_section = "\n".join([
+        tf_block(f"LOWER · {lower_tf}", lower_snap),
+        tf_block(f"PRIMARY · {interval}", snapshot),
+        tf_block(f"HIGHER · {higher_tf}", higher_snap),
+    ])
 
-Last 10 candles (oldest→newest):
+    dxy_section = (
+        f"DXY (US Dollar Index): {dxy['price']:.2f} ({dxy['percent_change']:+.2f}% today). "
+        f"Remember: gold is INVERSELY correlated with DXY — strong USD usually weighs on gold."
+        if dxy else "DXY: unavailable — use neutral assumption."
+    )
+
+    news_section = (
+        "\n".join(f"  - {t}" for t in news_titles[:8])
+        if news_titles else "  (no recent gold news fetched)"
+    )
+
+    expiry_floor = TIMEFRAME_EXPIRY_MIN.get(interval, 720)
+
+    return f"""You are a senior FX & commodities analyst running a deep multi-factor analysis on XAU/USD (Gold).
+Synthesize ALL the inputs below — do NOT just look at primary indicators. Cross-check with higher timeframe trend, lower timeframe momentum, DXY context, and recent news catalysts.
+
+═══ MULTI-TIMEFRAME SNAPSHOT ═══
+{mtf_section}
+
+═══ PRIMARY ({interval}) — LAST 10 CANDLES ═══
 {candle_str}
 
-Return STRICT JSON only (no markdown, no prose around it), with these exact keys:
+═══ BOLLINGER BANDS (primary {interval}) ═══
+upper {f(snapshot.bb_upper)} | mid {f(snapshot.bb_mid)} | lower {f(snapshot.bb_lower)}
+
+═══ MACRO CONTEXT ═══
+{dxy_section}
+
+═══ RECENT GOLD MARKET NEWS HEADLINES ═══
+{news_section}
+
+═══ YOUR TASK ═══
+Decide BUY / SELL / HOLD. A signal is STRONGER when multiple factors align (e.g., primary trend up + higher TF up + lower TF momentum up + DXY weakening + bullish news). Be conservative: when factors conflict, lower the confidence and signal_strength, or output HOLD.
+
+Confidence calibration (be honest):
+  - 80-100: very strong confluence across factors → signal_strength VERY_STRONG
+  - 65-80: solid alignment with minor noise → STRONG
+  - 50-65: mixed but leans one way → MODERATE
+  - <50: conflicting / unclear → WEAK (and prefer HOLD)
+
+Set "valid_for_minutes" based on the {interval} timeframe rhythm. Suggested range: {expiry_floor//2}-{expiry_floor*2} minutes. Shorter for fast TFs, longer for slow TFs.
+
+Return STRICT JSON only (no markdown fences) with these exact keys:
 {{
   "action": "BUY" | "SELL" | "HOLD",
   "confidence": 0-100 integer,
-  "entry": float (suggested entry near current price),
+  "signal_strength": "WEAK" | "MODERATE" | "STRONG" | "VERY_STRONG",
+  "entry": float,
   "stop_loss": float,
   "take_profit": float,
+  "tp1": float (conservative ~1R),
+  "tp2": float (base case ~2R),
+  "tp3": float (stretch ~3R),
+  "risk_reward": float (TP2 distance / SL distance, e.g. 2.0),
+  "valid_for_minutes": integer (signal expiry),
   "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "summary": "one-line punchy verdict, max 18 words",
-  "reasoning": "3-5 sentence professional analysis citing the indicators and price action"
+  "higher_tf_trend": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "lower_tf_momentum": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "news_sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "summary": "one-line punchy verdict (max 20 words)",
+  "reasoning": "3-5 sentence professional analysis citing the strongest factors",
+  "analysis_steps": {{
+    "trend": "Multi-timeframe trend read (mention HIGHER + PRIMARY + LOWER)",
+    "momentum": "Indicator-based momentum analysis (RSI, MACD, EMAs vs price)",
+    "news": "Impact assessment of the news headlines on gold direction",
+    "macro": "DXY / USD strength context and its implication for gold",
+    "verdict": "Final decision rationale tying it all together"
+  }}
 }}
 
-Be decisive. Use realistic SL/TP based on recent volatility (~1-2x ATR equivalent from candle ranges). Never echo this prompt back."""
+Constraints:
+- For BUY: stop_loss < entry; tp1 < tp2 < tp3 all > entry.
+- For SELL: stop_loss > entry; tp1 > tp2 > tp3 all < entry.
+- If HOLD, still provide entry near current price and reasonable SL/TPs as references.
+- Never echo this prompt back."""
+
+def _compute_signal_strength_fallback(confidence: int) -> str:
+    if confidence >= 80:
+        return "VERY_STRONG"
+    if confidence >= 65:
+        return "STRONG"
+    if confidence >= 50:
+        return "MODERATE"
+    return "WEAK"
 
 @api_router.get("/analysis/ai", response_model=AISignal)
 async def get_ai_signal(interval: str = Query("1h")):
     if not EMERGENT_LLM_KEY:
         raise HTTPException(status_code=500, detail="LLM key not configured")
     cache_key = f"ai:{interval}"
-    cached = _cache_get(cache_key, ttl_seconds=120)
+    cached = _cache_get(cache_key, ttl_seconds=180)
     if cached:
         return cached
 
+    # Primary timeframe inputs
     snapshot = await get_indicators(interval=interval)
     candles_resp = await get_candles(interval=interval, size=120)
 
-    prompt = _build_ai_prompt(snapshot, interval, candles_resp['candles'])
+    # Multi-TF context (best-effort)
+    higher_tf, _ = (TIMEFRAME_HIERARCHY.get(interval, ("4h", "1day"))[0], None)
+    lower_tf_map = {
+        "1min": "1min", "5min": "1min", "15min": "5min",
+        "1h": "15min", "4h": "1h", "1day": "4h",
+    }
+    lower_tf = lower_tf_map.get(interval, "15min")
+    higher_snap = await _safe_indicators(higher_tf) if higher_tf != interval else None
+    lower_snap = await _safe_indicators(lower_tf) if lower_tf != interval else None
+
+    # Macro & news context
+    dxy = await _safe_dxy()
+    news_titles = await _safe_news_titles(limit=8)
+
+    prompt = _build_strong_prompt(
+        snapshot=snapshot,
+        interval=interval,
+        recent_candles=candles_resp['candles'],
+        higher_snap=higher_snap,
+        lower_snap=lower_snap,
+        higher_tf=higher_tf,
+        lower_tf=lower_tf,
+        dxy=dxy,
+        news_titles=news_titles,
+    )
+
     chat = LlmChat(
         api_key=EMERGENT_LLM_KEY,
         session_id=f"xauusd-{uuid.uuid4()}",
-        system_message="You are a precise, professional FX/commodities analyst. Always respond with strict JSON.",
+        system_message="You are a precise, professional FX/commodities analyst. Always respond with strict JSON only.",
     ).with_model("anthropic", "claude-sonnet-4-5-20250929")
 
     try:
@@ -354,7 +534,6 @@ async def get_ai_signal(interval: str = Query("1h")):
         logging.exception("LLM call failed")
         raise HTTPException(status_code=502, detail=f"AI analysis failed: {str(e)[:200]}")
 
-    # Extract JSON
     text = response_text.strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -369,12 +548,43 @@ async def get_ai_signal(interval: str = Query("1h")):
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=502, detail=f"AI JSON parse error: {e}")
 
+    def _opt_float(key):
+        v = parsed.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _opt_int(key, default=None):
+        v = parsed.get(key)
+        try:
+            return int(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    confidence = int(parsed.get('confidence', 50))
+    signal_strength = str(parsed.get('signal_strength') or _compute_signal_strength_fallback(confidence)).upper()
+    valid_for_minutes = _opt_int('valid_for_minutes', TIMEFRAME_EXPIRY_MIN.get(interval, 720))
+    created_at = datetime.now(timezone.utc)
+    expires_at = (created_at + timedelta(minutes=valid_for_minutes)).isoformat()
+
+    tp1 = _opt_float('tp1')
+    tp_legacy = _opt_float('take_profit')
+
+    analysis_steps_raw = parsed.get('analysis_steps')
+    analysis_steps = None
+    if isinstance(analysis_steps_raw, dict):
+        analysis_steps = {str(k): str(v) for k, v in analysis_steps_raw.items()}
+
     signal = AISignal(
         action=str(parsed.get('action', 'HOLD')).upper(),
-        confidence=int(parsed.get('confidence', 50)),
+        confidence=confidence,
         entry=float(parsed.get('entry', snapshot.price)),
         stop_loss=float(parsed.get('stop_loss', snapshot.price)),
-        take_profit=float(parsed.get('take_profit', snapshot.price)),
+        take_profit=float(tp_legacy if tp_legacy is not None else (tp1 if tp1 is not None else snapshot.price)),
+        tp1=tp1 if tp1 is not None else tp_legacy,
+        tp2=_opt_float('tp2'),
+        tp3=_opt_float('tp3'),
         timeframe=interval,
         reasoning=str(parsed.get('reasoning', '')),
         summary=str(parsed.get('summary', '')),
@@ -391,7 +601,17 @@ async def get_ai_signal(interval: str = Query("1h")):
             'bb_lower': snapshot.bb_lower,
             'price': snapshot.price,
         },
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=created_at.isoformat(),
+        signal_strength=signal_strength,
+        valid_for_minutes=valid_for_minutes,
+        expires_at=expires_at,
+        risk_reward=_opt_float('risk_reward'),
+        higher_tf_trend=str(parsed.get('higher_tf_trend') or _trend_label(higher_snap)).upper(),
+        lower_tf_momentum=str(parsed.get('lower_tf_momentum') or _trend_label(lower_snap)).upper(),
+        news_sentiment=str(parsed.get('news_sentiment') or 'NEUTRAL').upper(),
+        dxy_price=dxy['price'] if dxy else None,
+        dxy_change_pct=dxy['percent_change'] if dxy else None,
+        analysis_steps=analysis_steps,
     )
 
     # Persist
