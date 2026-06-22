@@ -5,6 +5,7 @@ import AISignalCard from "@/components/AISignalCard";
 import IndicatorsPanel from "@/components/IndicatorsPanel";
 import NewsFeed from "@/components/NewsFeed";
 import SignalHistory from "@/components/SignalHistory";
+import WinRateTracker from "@/components/WinRateTracker";
 import { Activity } from "lucide-react";
 import { fetchAISignal } from "@/lib/api";
 
@@ -135,6 +136,9 @@ export default function Dashboard() {
                         refreshKey={refreshKey}
                         aiSignal={aiSignal && aiSignal.confidence >= confidenceThreshold ? aiSignal : null}
                     />
+                    <div className="mt-2">
+                        <WinRateTracker refreshKey={refreshKey} />
+                    </div>
                     <div className="mt-2 grid grid-cols-12 gap-2">
                         <div className="col-span-12 lg:col-span-7">
                             <IndicatorsPanel interval={interval} refreshKey={refreshKey} />

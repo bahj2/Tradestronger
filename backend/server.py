@@ -742,6 +742,172 @@ async def signal_history(limit: int = Query(20, le=100)):
     docs = await db.ai_signals.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit)
     return {"signals": docs}
 
+
+# ------------------- Signal grading & stats -------------------
+async def _grade_signal(signal_doc: dict) -> Optional[dict]:
+    """Determine outcome of a past signal by walking historical candles.
+    Returns dict of fields to persist, or None if signal cannot/should not be graded."""
+    action = (signal_doc.get('action') or 'HOLD').upper()
+    if action == 'HOLD':
+        return None
+    if signal_doc.get('outcome') in ('TP1', 'TP2', 'TP3', 'SL', 'EXPIRED', 'NO_DATA'):
+        return None  # already graded
+
+    created_str = signal_doc.get('created_at')
+    expires_str = signal_doc.get('expires_at')
+    if not created_str or not expires_str:
+        return None
+    try:
+        created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+        expires = datetime.fromisoformat(expires_str.replace('Z', '+00:00'))
+    except (ValueError, AttributeError):
+        return None
+
+    now = datetime.now(timezone.utc)
+    # Still active and within validity window
+    if now < expires:
+        return None
+
+    interval = signal_doc.get('timeframe', '1h')
+    try:
+        candles_resp = await get_candles(interval=interval, size=500)
+        all_candles = candles_resp.get('candles', [])
+    except Exception:
+        return None
+
+    start_ts = int(created.timestamp())
+    end_ts = int(expires.timestamp())
+    window = [c for c in all_candles if start_ts <= c['time'] <= end_ts]
+    if not window:
+        # Outside cached range — mark NO_DATA so we don't re-try
+        return {'outcome': 'NO_DATA', 'graded_at': now.isoformat()}
+
+    try:
+        entry = float(signal_doc['entry'])
+        sl = float(signal_doc['stop_loss'])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    tp1 = signal_doc.get('tp1') or signal_doc.get('take_profit')
+    tp2 = signal_doc.get('tp2')
+    tp3 = signal_doc.get('tp3')
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0:
+        return None
+
+    def _result(outcome: str, exit_price: float, exit_time: int, candle: dict):
+        if action == 'BUY':
+            r = (exit_price - entry) / sl_dist
+        else:
+            r = (entry - exit_price) / sl_dist
+        return {
+            'outcome': outcome,
+            'r_multiple': round(r, 3),
+            'exit_price': exit_price,
+            'exit_time': exit_time,
+            'graded_at': now.isoformat(),
+        }
+
+    for c in window:
+        high, low = c['high'], c['low']
+        if action == 'BUY':
+            # Conservative: if both SL and TP touched in same candle, assume SL hit first
+            if low <= sl:
+                return _result('SL', sl, c['time'], c)
+            if tp3 is not None and high >= float(tp3):
+                return _result('TP3', float(tp3), c['time'], c)
+            if tp2 is not None and high >= float(tp2):
+                return _result('TP2', float(tp2), c['time'], c)
+            if tp1 is not None and high >= float(tp1):
+                return _result('TP1', float(tp1), c['time'], c)
+        elif action == 'SELL':
+            if high >= sl:
+                return _result('SL', sl, c['time'], c)
+            if tp3 is not None and low <= float(tp3):
+                return _result('TP3', float(tp3), c['time'], c)
+            if tp2 is not None and low <= float(tp2):
+                return _result('TP2', float(tp2), c['time'], c)
+            if tp1 is not None and low <= float(tp1):
+                return _result('TP1', float(tp1), c['time'], c)
+
+    # Expired without hitting TP or SL — use last close as exit
+    last = window[-1]
+    return _result('EXPIRED', last['close'], last['time'], last)
+
+
+@api_router.get("/signals/stats")
+async def signal_stats():
+    # Load all non-HOLD signals
+    signals = await db.ai_signals.find(
+        {"action": {"$ne": "HOLD"}}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    # Lazy-grade ungraded ones
+    for s in signals:
+        if not s.get('outcome'):
+            updates = await _grade_signal(s)
+            if updates:
+                await db.ai_signals.update_one({'id': s['id']}, {'$set': updates})
+                s.update(updates)
+
+    graded = [s for s in signals if s.get('outcome') in ('TP1', 'TP2', 'TP3', 'SL', 'EXPIRED')]
+
+    def _tally(rows: List[dict]) -> dict:
+        wins = [r for r in rows if r.get('outcome', '').startswith('TP')]
+        losses = [r for r in rows if r.get('outcome') == 'SL']
+        expired = [r for r in rows if r.get('outcome') == 'EXPIRED']
+        wl = len(wins) + len(losses)
+        win_rate = (len(wins) / wl * 100) if wl else 0.0
+        avg_r = (sum(r.get('r_multiple', 0) or 0 for r in rows) / len(rows)) if rows else 0.0
+        return {
+            'total': len(rows),
+            'wins': len(wins),
+            'losses': len(losses),
+            'expired': len(expired),
+            'win_rate': round(win_rate, 1),
+            'avg_r': round(avg_r, 2),
+        }
+
+    overall = _tally(graded)
+
+    by_tf: Dict[str, List[dict]] = {}
+    for s in graded:
+        by_tf.setdefault(s.get('timeframe', '?'), []).append(s)
+    by_timeframe = [
+        {'timeframe': tf, **_tally(rows)} for tf, rows in by_tf.items()
+    ]
+    by_timeframe.sort(key=lambda x: x['total'], reverse=True)
+
+    now = datetime.now(timezone.utc)
+    def _window(days: int):
+        cutoff = now - timedelta(days=days)
+        recent = [
+            s for s in graded
+            if datetime.fromisoformat(s['created_at'].replace('Z', '+00:00')) >= cutoff
+        ]
+        return {'period_days': days, **_tally(recent)}
+
+    return {
+        'overall': overall,
+        'by_timeframe': by_timeframe,
+        'period_7d': _window(7),
+        'period_30d': _window(30),
+        'best_streak': _best_streak(graded),
+    }
+
+
+def _best_streak(rows: List[dict]) -> int:
+    """Longest consecutive wins, looking at chronological order (oldest→newest)."""
+    rows_sorted = sorted(rows, key=lambda r: r.get('created_at', ''))
+    best, cur = 0, 0
+    for r in rows_sorted:
+        if (r.get('outcome') or '').startswith('TP'):
+            cur += 1
+            best = max(best, cur)
+        elif r.get('outcome') == 'SL':
+            cur = 0
+    return best
+
 @api_router.get("/news")
 async def get_news(limit: int = Query(12, le=30)):
     items = await _fetch_all_news()

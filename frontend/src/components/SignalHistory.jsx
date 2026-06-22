@@ -25,6 +25,18 @@ const consensusDot = (c) => {
     return { color: "#737373", title: "Legacy" };
 };
 
+const outcomeStyle = (o) => {
+    if (!o) return { label: "•", color: "#737373", bg: "transparent", title: "Active / Ungraded" };
+    if (o === "TP1") return { label: "✓ TP1", color: "#00B86B", bg: "rgba(0,184,107,0.12)", title: "Hit TP1" };
+    if (o === "TP2") return { label: "✓✓ TP2", color: "#00B86B", bg: "rgba(0,184,107,0.18)", title: "Hit TP2" };
+    if (o === "TP3") return { label: "✓✓✓ TP3", color: "#00B86B", bg: "rgba(0,184,107,0.25)", title: "Hit TP3" };
+    if (o === "SL") return { label: "✗ SL", color: "#FF2A55", bg: "rgba(255,42,85,0.15)", title: "Hit Stop Loss" };
+    if (o === "EXPIRED") return { label: "⏸ EXP", color: "#A3A3A3", bg: "rgba(163,163,163,0.1)", title: "Expired" };
+    if (o === "NO_DATA") return { label: "?", color: "#737373", bg: "transparent", title: "Outside data window" };
+    return { label: o, color: "#737373", bg: "transparent", title: o };
+};
+
+
 export default function SignalHistory({ refreshKey }) {
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -94,11 +106,13 @@ export default function SignalHistory({ refreshKey }) {
                                 <th className="px-3 py-2 text-right">Entry</th>
                                 <th className="px-3 py-2 text-right">SL</th>
                                 <th className="px-3 py-2 text-right">TP</th>
+                                <th className="px-3 py-2 text-center">Result</th>
                             </tr>
                         </thead>
                         <tbody>
                             {shown.map((s, i) => {
                                 const dot = consensusDot(s.consensus);
+                                const out = outcomeStyle(s.outcome);
                                 return (
                                     <tr key={s.id || i} className="border-b border-[#262626]/60 hover:bg-[#1A1A1A]" data-testid={`signal-row-${i}`}>
                                         <td className="px-3 py-2 font-mono text-xs text-gray-400">{timeAgo(s.created_at)} ago</td>
@@ -117,6 +131,15 @@ export default function SignalHistory({ refreshKey }) {
                                         <td className="px-3 py-2 font-mono text-xs text-right text-white">{fmt(s.entry)}</td>
                                         <td className="px-3 py-2 font-mono text-xs text-right text-[#FF2A55]">{fmt(s.stop_loss)}</td>
                                         <td className="px-3 py-2 font-mono text-xs text-right text-[#00B86B]">{fmt(s.tp1 ?? s.take_profit)}</td>
+                                        <td className="px-3 py-2 text-center">
+                                            <span
+                                                className="inline-block px-1.5 py-0.5 rounded-sm font-mono text-[10px] tracking-tight"
+                                                style={{ color: out.color, background: out.bg }}
+                                                title={out.title}
+                                            >
+                                                {out.label}
+                                            </span>
+                                        </td>
                                     </tr>
                                 );
                             })}
