@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -743,6 +744,65 @@ async def get_ai_signal(interval: str = Query("1h")):
 async def signal_history(limit: int = Query(20, le=100)):
     docs = await db.ai_signals.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit)
     return {"signals": docs}
+
+
+# ------------------- MT5 EA endpoints -------------------
+@api_router.get("/ea/signal")
+async def ea_latest_signal(
+    last_id: Optional[str] = Query(None),
+    strength: str = Query("STRONG"),
+    interval: Optional[str] = Query(None),
+):
+    """Latest fresh (non-expired, non-HOLD) signal for MT5 EA polling.
+    Returns has_signal=false if no new signal since last_id."""
+    query: Dict[str, Any] = {"action": {"$ne": "HOLD"}}
+    if interval:
+        query["timeframe"] = interval
+    now_iso = datetime.now(timezone.utc).isoformat()
+    query["expires_at"] = {"$gte": now_iso}
+
+    if strength.upper() == "STRONG":
+        query["consensus"] = "DOUBLE_CONFIRMED"
+        query["signal_strength"] = {"$in": ["STRONG", "VERY_STRONG"]}
+
+    signal = await db.ai_signals.find_one(query, {"_id": 0}, sort=[("created_at", -1)])
+    if not signal:
+        return {"has_signal": False}
+
+    if last_id and signal.get("id") == last_id:
+        return {"has_signal": False, "current_id": signal.get("id")}
+
+    tp1 = signal.get("tp1") or signal.get("take_profit")
+    return {
+        "has_signal": True,
+        "id": signal["id"],
+        "action": signal["action"],
+        "symbol": "XAUUSD",
+        "timeframe": signal["timeframe"],
+        "entry": signal["entry"],
+        "stop_loss": signal["stop_loss"],
+        "tp1": tp1,
+        "tp2": signal.get("tp2"),
+        "tp3": signal.get("tp3"),
+        "confidence": signal["confidence"],
+        "strength": signal.get("signal_strength"),
+        "consensus": signal.get("consensus"),
+        "created_at": signal["created_at"],
+        "expires_at": signal["expires_at"],
+    }
+
+
+@api_router.get("/ea/download")
+async def ea_download():
+    """Serve the MT5 EA .mq5 file"""
+    path = Path(__file__).parent / "static" / "AurumXAUUSD.mq5"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="EA file not found")
+    return FileResponse(
+        path=str(path),
+        media_type="application/octet-stream",
+        filename="AurumXAUUSD.mq5",
+    )
 
 
 # ------------------- Signal grading & stats -------------------

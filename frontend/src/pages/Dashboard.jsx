@@ -9,6 +9,7 @@ import WinRateTracker from "@/components/WinRateTracker";
 import { Activity } from "lucide-react";
 import { fetchAISignal } from "@/lib/api";
 import TelegramSettings from "@/components/TelegramSettings";
+import EASettings from "@/components/EASettings";
 
 const TIMEFRAMES = [
     { id: "1min", label: "1m" },
@@ -73,6 +74,7 @@ export default function Dashboard() {
                             <span>LIVE · TWELVEDATA</span>
                         </div>
                         <TelegramSettings />
+                        <EASettings />
                         <button
                             onClick={refresh}
                             data-testid="refresh-btn"
