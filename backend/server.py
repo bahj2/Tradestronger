@@ -939,7 +939,7 @@ async def get_ai_signal(
     engine: str = Query("rule"),  # "rule" (free, default) or "ai" (dual-LLM)
     auto_upgrade: bool = Query(False),  # When engine=rule and signal is STRONG, auto-escalate to dual-LLM
     news_blackout: bool = Query(False),  # If True, override BUY/SELL to HOLD when inside a high-impact USD news window
-    blackout_window: int = Query(15, ge=0, le=120),  # ± minutes around event
+    blackout_window: int = Query(15, ge=0, le=480),  # ± minutes around event (up to 8h for FOMC-day avoidance)
 ):
     cache_key = f"ai:{engine}:au{int(auto_upgrade)}:nb{int(news_blackout)}:bw{blackout_window}:{interval}"
     cached = _cache_get(cache_key, ttl_seconds=180 if engine == "ai" else 60)
@@ -1651,7 +1651,7 @@ async def get_calendar_events(
     return {"items": events[:limit], "source": "ForexFactory"}
 
 @api_router.get("/calendar/blackout")
-async def get_blackout_status(window_minutes: int = Query(15, ge=0, le=120)):
+async def get_blackout_status(window_minutes: int = Query(15, ge=0, le=480)):
     return await _get_blackout_status(window_minutes=window_minutes)
 
 # ------------------- Telegram Alerts -------------------

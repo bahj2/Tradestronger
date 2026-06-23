@@ -63,10 +63,22 @@
 - ✅ **Auto-upgrade to Deep AI** toggle: free Rule Engine watches continuously, when it flags STRONG/VERY_STRONG → auto-escalates to Dual-AI (Claude + Gemini) for cross-checked verdict. Saves LLM tokens vs. continuous polling.
 - ✅ **Strong-only filter** toggle: suppresses chart overlays + adds blocking warning when signal_strength ∉ {STRONG, VERY_STRONG} — prevents low-quality trades.
 - ✅ Backend tests: 21 passed, 1 skipped (market-dependent). Test file at `/app/backend/tests/test_auto_upgrade.py`.
+- 📈 **Real-world impact: win rate jumped from 0% → 47.1%** (31 graded signals after ATR rollout; 8-trade win streak; avg -0.07R vs. prior -0.83R).
+
+### Phase 6 — News-Blackout Filter (✅ Complete — Feb 23, 2026)
+- ✅ Free ForexFactory weekly XML feed (`https://nfs.faireconomy.media/ff_calendar_thisweek.xml`)
+- ✅ 30-min cached economic-calendar service (`_fetch_economic_calendar`) with stale-fallback on network errors
+- ✅ Eastern Time → UTC conversion via `zoneinfo.ZoneInfo('America/New_York')`
+- ✅ Gold-sensitive detection: USD + High impact OR title contains FOMC/NFP/CPI/PPI/Powell/Fed-funds-rate keywords
+- ✅ New endpoints: `GET /api/calendar/events?country=USD&impact=High&limit=40`, `GET /api/calendar/blackout?window_minutes=15`
+- ✅ `/api/analysis/ai?news_blackout=true&blackout_window=15` overrides BUY/SELL → HOLD when inside ±N min of an event; halves confidence; summary prefixed `BLACKOUT —`; original signal preserved in `news_blackout.overridden_from`
+- ✅ UI: News-Blackout toggle in header (default ON), red 2-border override banner in AI Signal card when active, ambient "Next USD event" gold pill when next event is within 4h
+- ✅ Cache key includes `nb` and `bw` flags → no cache bleed between filter on/off
+- ✅ blackout_window accepts 0-480 minutes (up to 8h — enough for FOMC-day full avoidance)
+- ✅ Backend tests: 27/27 passed. Test file at `/app/backend/tests/test_news_blackout.py`.
 
 ## Backlog (P1)
 - Mobile responsive UI redesign (current desktop-first design breaks under 768px)
-- News-blackout filter (skip signals 15min before/after high-impact USD news like NFP/FOMC)
 - Trailing-stop simulation (model break-even move after TP1 hits → realized R boost)
 - Improve TwelveData 429-as-500 leak → graceful 429 with Retry-After or stale-cache fallback
 
