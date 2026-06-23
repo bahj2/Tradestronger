@@ -12,8 +12,10 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import httpx
 import feedparser
+import xml.etree.ElementTree as ET
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 ROOT_DIR = Path(__file__).parent
@@ -313,6 +315,8 @@ class AISignal(BaseModel):
     sl_method: Optional[str] = None
     # True when rule engine produced STRONG and we auto-escalated to Dual-AI
     auto_upgraded: bool = False
+    # Economic-calendar blackout context (None when filter disabled)
+    news_blackout: Optional[Dict[str, Any]] = None
 
 # ------------------- Routes -------------------
 @api_router.get("/")
@@ -934,8 +938,10 @@ async def get_ai_signal(
     interval: str = Query("1h"),
     engine: str = Query("rule"),  # "rule" (free, default) or "ai" (dual-LLM)
     auto_upgrade: bool = Query(False),  # When engine=rule and signal is STRONG, auto-escalate to dual-LLM
+    news_blackout: bool = Query(False),  # If True, override BUY/SELL to HOLD when inside a high-impact USD news window
+    blackout_window: int = Query(15, ge=0, le=120),  # ± minutes around event
 ):
-    cache_key = f"ai:{engine}:au{int(auto_upgrade)}:{interval}"
+    cache_key = f"ai:{engine}:au{int(auto_upgrade)}:nb{int(news_blackout)}:bw{blackout_window}:{interval}"
     cached = _cache_get(cache_key, ttl_seconds=180 if engine == "ai" else 60)
     if cached:
         return cached
@@ -1074,9 +1080,45 @@ async def get_ai_signal(
     if isinstance(analysis_steps_raw, dict):
         analysis_steps = {str(k): str(v) for k, v in analysis_steps_raw.items()}
 
+    # ----- News-blackout override -----
+    blackout_payload: Optional[Dict[str, Any]] = None
+    final_action = str(parsed.get('action', 'HOLD')).upper()
+    final_summary = str(parsed.get('summary', ''))
+    final_reasoning = str(parsed.get('reasoning', ''))
+    final_confidence = confidence
+
+    if news_blackout:
+        try:
+            status = await _get_blackout_status(window_minutes=blackout_window)
+        except Exception as bb_err:
+            logging.warning(f"Blackout check failed: {bb_err}")
+            status = {"in_blackout": False, "current_event": None, "next_event": None,
+                      "window_minutes": blackout_window}
+        blackout_payload = {**status, "filter_enabled": True}
+
+        if status.get("in_blackout") and final_action in ("BUY", "SELL"):
+            ev = status.get("current_event") or {}
+            ev_title = ev.get("title") or "high-impact USD event"
+            mins = ev.get("minutes_until")
+            mins_txt = (
+                f"in {abs(mins):.0f} min" if mins is not None and mins > 0
+                else f"{abs(mins):.0f} min ago" if mins is not None else "now"
+            )
+            blackout_payload["overridden_from"] = final_action
+            final_action = "HOLD"
+            final_confidence = max(20, int(final_confidence * 0.5))
+            final_summary = f"BLACKOUT — {ev_title} {mins_txt}. Original setup: {parsed.get('action')}."
+            final_reasoning = (
+                f"News-blackout filter active (±{blackout_window} min). "
+                f"{ev_title} scheduled {mins_txt}; gold typically whipsaws. "
+                f"Original analysis: {final_reasoning}"
+            )
+    else:
+        blackout_payload = {"filter_enabled": False, "in_blackout": False}
+
     signal = AISignal(
-        action=str(parsed.get('action', 'HOLD')).upper(),
-        confidence=confidence,
+        action=final_action,
+        confidence=final_confidence,
         entry=float(parsed.get('entry', snapshot.price)),
         stop_loss=float(parsed.get('stop_loss', snapshot.price)),
         take_profit=float(tp_legacy if tp_legacy is not None else (tp1 if tp1 is not None else snapshot.price)),
@@ -1084,8 +1126,8 @@ async def get_ai_signal(
         tp2=_opt_float('tp2'),
         tp3=_opt_float('tp3'),
         timeframe=interval,
-        reasoning=str(parsed.get('reasoning', '')),
-        summary=str(parsed.get('summary', '')),
+        reasoning=final_reasoning,
+        summary=final_summary,
         sentiment=str(parsed.get('sentiment', 'NEUTRAL')).upper(),
         indicators={
             'rsi': snapshot.rsi,
@@ -1115,6 +1157,7 @@ async def get_ai_signal(
         news_sources=[{'title': i.get('title', ''), 'source': i.get('source', ''), 'link': i.get('link', '')} for i in news_items],
         sl_method=parsed.get('sl_method'),
         auto_upgraded=auto_upgraded,
+        news_blackout=blackout_payload,
     )
 
     await db.ai_signals.insert_one(signal.model_dump())
@@ -1463,6 +1506,153 @@ def _best_streak(rows: List[dict]) -> int:
 async def get_news(limit: int = Query(12, le=30)):
     items = await _fetch_all_news()
     return {"items": items[:limit]}
+
+# ------------------- Economic Calendar / News Blackout -------------------
+# ForexFactory weekly XML mirror — free, no auth. Times are Eastern Time (ET).
+FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+ET_TZ = ZoneInfo("America/New_York")
+
+# Pairs that move XAU/USD most aggressively
+GOLD_SENSITIVE_COUNTRIES = {"USD"}
+# Even if marked "Medium", a few events historically whipsaw gold violently
+HIGH_PRIORITY_TITLES = {
+    "NFP", "Non-Farm", "FOMC", "CPI", "PPI", "Unemployment Rate",
+    "Federal Funds Rate", "Fed Chair", "Powell",
+}
+
+def _parse_ff_event_time(date_str: str, time_str: str) -> Optional[datetime]:
+    """ForexFactory format: date='MM-DD-YYYY', time='1:30am' / 'All Day' / 'Tentative'.
+    Returns UTC datetime or None if non-scheduled."""
+    if not date_str or not time_str:
+        return None
+    t = time_str.strip().lower()
+    if t in ("all day", "tentative", "", "n/a"):
+        return None
+    try:
+        # ForexFactory times are Eastern Time
+        dt_naive = datetime.strptime(f"{date_str} {time_str}", "%m-%d-%Y %I:%M%p")
+        return dt_naive.replace(tzinfo=ET_TZ).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+async def _fetch_economic_calendar() -> List[dict]:
+    """Fetch & parse ForexFactory weekly XML. Cached 30 min."""
+    cached = _cache_get("ff_calendar", ttl_seconds=1800)
+    if cached is not None:
+        return cached
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AurumTerminal/1.0)"},
+        ) as http:
+            r = await http.get(FF_CALENDAR_URL)
+            r.raise_for_status()
+            raw = r.content
+    except Exception as e:
+        logging.warning(f"ForexFactory fetch failed: {e}")
+        stale = _cache_get_stale("ff_calendar") or []
+        return stale
+
+    events: List[dict] = []
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        logging.warning(f"ForexFactory XML parse failed: {e}")
+        return []
+
+    for node in root.findall("event"):
+        def _t(tag):
+            el = node.find(tag)
+            return (el.text or "").strip() if el is not None and el.text else ""
+
+        date_str = _t("date")
+        time_str = _t("time")
+        impact = _t("impact") or "Low"
+        country = _t("country").upper()
+        title = _t("title")
+        when_utc = _parse_ff_event_time(date_str, time_str)
+
+        events.append({
+            "title": title,
+            "country": country,
+            "impact": impact,
+            "forecast": _t("forecast"),
+            "previous": _t("previous"),
+            "url": _t("url"),
+            "time_et": time_str,           # original ET label
+            "date_et": date_str,
+            "when_utc": when_utc.isoformat() if when_utc else None,
+            "scheduled": when_utc is not None,
+        })
+
+    # Sort by time (None last)
+    events.sort(key=lambda e: (e["when_utc"] is None, e["when_utc"] or ""))
+    _cache_set("ff_calendar", events)
+    return events
+
+def _is_gold_sensitive(ev: dict) -> bool:
+    """High-impact USD events, OR any event whose title matches our priority list."""
+    if ev.get("country") in GOLD_SENSITIVE_COUNTRIES and ev.get("impact") == "High":
+        return True
+    title = (ev.get("title") or "").lower()
+    return any(kw.lower() in title for kw in HIGH_PRIORITY_TITLES) and ev.get("country") in GOLD_SENSITIVE_COUNTRIES
+
+async def _get_blackout_status(window_minutes: int = 15) -> dict:
+    """Returns blackout status for the current moment.
+    in_blackout=True when a gold-sensitive event is within ±window_minutes."""
+    events = await _fetch_economic_calendar()
+    now = datetime.now(timezone.utc)
+    relevant = [e for e in events if e.get("scheduled") and _is_gold_sensitive(e)]
+
+    in_blackout = False
+    current_event = None
+    next_event = None
+    min_until = None
+
+    for e in relevant:
+        try:
+            when = datetime.fromisoformat(e["when_utc"])
+        except (ValueError, TypeError):
+            continue
+        delta_min = (when - now).total_seconds() / 60.0
+
+        # Inside blackout window (within ±window_minutes)
+        if -window_minutes <= delta_min <= window_minutes:
+            in_blackout = True
+            current_event = {**e, "minutes_until": round(delta_min, 1)}
+
+        # Next upcoming
+        if delta_min > 0 and (min_until is None or delta_min < min_until):
+            min_until = delta_min
+            next_event = {**e, "minutes_until": round(delta_min, 1)}
+
+    return {
+        "in_blackout": in_blackout,
+        "window_minutes": window_minutes,
+        "current_event": current_event,
+        "next_event": next_event,
+        "now_utc": now.isoformat(),
+    }
+
+@api_router.get("/calendar/events")
+async def get_calendar_events(
+    country: Optional[str] = Query(None, description="Filter by country code, e.g. USD"),
+    impact: Optional[str] = Query(None, description="Low | Medium | High"),
+    only_scheduled: bool = Query(True),
+    limit: int = Query(40, le=100),
+):
+    events = await _fetch_economic_calendar()
+    if country:
+        events = [e for e in events if e.get("country") == country.upper()]
+    if impact:
+        events = [e for e in events if e.get("impact", "").lower() == impact.lower()]
+    if only_scheduled:
+        events = [e for e in events if e.get("scheduled")]
+    return {"items": events[:limit], "source": "ForexFactory"}
+
+@api_router.get("/calendar/blackout")
+async def get_blackout_status(window_minutes: int = Query(15, ge=0, le=120)):
+    return await _get_blackout_status(window_minutes=window_minutes)
 
 # ------------------- Telegram Alerts -------------------
 class TelegramConfig(BaseModel):

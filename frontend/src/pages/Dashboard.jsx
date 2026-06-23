@@ -30,6 +30,8 @@ export default function Dashboard() {
     const [engine, setEngine] = useState("rule");
     const [autoUpgrade, setAutoUpgrade] = useState(true);
     const [strongOnly, setStrongOnly] = useState(false);
+    const [newsBlackout, setNewsBlackout] = useState(true);
+    const [blackoutWindow] = useState(15);
 
     const refresh = () => setRefreshKey((k) => k + 1);
 
@@ -38,7 +40,7 @@ export default function Dashboard() {
         setAiLoading(true);
         setAiError(null);
         try {
-            const s = await fetchAISignal(interval, useEngine, autoUpgrade);
+            const s = await fetchAISignal(interval, useEngine, autoUpgrade, newsBlackout, blackoutWindow);
             setAiSignal(s);
             if (forceEngine) setEngine(forceEngine);
         } catch (e) {
@@ -47,7 +49,7 @@ export default function Dashboard() {
         } finally {
             setAiLoading(false);
         }
-    }, [interval, engine, autoUpgrade]);
+    }, [interval, engine, autoUpgrade, newsBlackout, blackoutWindow]);
 
     useEffect(() => {
         document.title = "AURUM TERMINAL — XAU/USD Pro Analytics";
@@ -124,6 +126,19 @@ export default function Dashboard() {
                             className="accent-[#D4AF37] cursor-pointer"
                         />
                         Auto-upgrade to Deep AI
+                    </label>
+                    <label
+                        className="hidden md:flex items-center gap-1.5 text-[10px] font-mono text-gray-400 uppercase tracking-[0.15em] cursor-pointer select-none"
+                        title={`When ON: BUY/SELL signals are forced to HOLD inside ±${blackoutWindow} min of high-impact USD news (NFP, FOMC, CPI…). Avoids news-spike whipsaws.`}
+                    >
+                        <input
+                            type="checkbox"
+                            data-testid="news-blackout-toggle"
+                            checked={newsBlackout}
+                            onChange={(e) => setNewsBlackout(e.target.checked)}
+                            className="accent-[#D4AF37] cursor-pointer"
+                        />
+                        News Blackout
                     </label>
                     <label
                         className="hidden md:flex items-center gap-1.5 text-[10px] font-mono text-gray-400 uppercase tracking-[0.15em] cursor-pointer select-none"

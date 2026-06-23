@@ -112,6 +112,10 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
     const newsSources = signal?.news_sources || [];
     const autoUpgraded = !!signal?.auto_upgraded;
     const slMethod = signal?.sl_method;
+    const blackout = signal?.news_blackout;
+    const inBlackout = !!blackout?.in_blackout;
+    const nextEvent = blackout?.next_event;
+    const overriddenFrom = blackout?.overridden_from;
 
     return (
         <div
@@ -181,6 +185,49 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
 
             {signal && (
                 <div className="p-4 space-y-4">
+                    {/* News-blackout HARD warning (signal overridden) */}
+                    {inBlackout && overriddenFrom && (
+                        <div
+                            className="px-3 py-2 border-2 border-[#FF2A55] bg-[#FF2A55]/15 rounded-sm text-[10px] font-mono uppercase tracking-[0.15em] text-[#FF2A55] flex items-start gap-2"
+                            data-testid="blackout-override-banner"
+                        >
+                            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                            <div>
+                                <div className="font-bold">News blackout · {overriddenFrom} → HOLD</div>
+                                {blackout?.current_event && (
+                                    <div className="text-gray-300 normal-case tracking-normal mt-0.5">
+                                        {blackout.current_event.title}
+                                        {blackout.current_event.minutes_until != null && (
+                                            <span className="text-[#FF2A55]">
+                                                {" · "}
+                                                {blackout.current_event.minutes_until > 0
+                                                    ? `in ${Math.round(blackout.current_event.minutes_until)}m`
+                                                    : `${Math.abs(Math.round(blackout.current_event.minutes_until))}m ago`}
+                                            </span>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Ambient "next event" pill (only when NOT in blackout) */}
+                    {!inBlackout && nextEvent && blackout?.filter_enabled && nextEvent.minutes_until <= 240 && (
+                        <div
+                            className="px-3 py-1.5 border border-[#D4AF37]/30 bg-[#D4AF37]/5 rounded-sm text-[10px] font-mono uppercase tracking-[0.15em] text-[#D4AF37] flex items-center gap-2"
+                            data-testid="next-event-pill"
+                        >
+                            <Newspaper className="w-3 h-3" />
+                            <span>Next USD event:</span>
+                            <span className="text-white normal-case tracking-normal truncate">{nextEvent.title}</span>
+                            <span className="ml-auto">
+                                {nextEvent.minutes_until < 60
+                                    ? `in ${Math.round(nextEvent.minutes_until)}m`
+                                    : `in ${(nextEvent.minutes_until / 60).toFixed(1)}h`}
+                            </span>
+                        </div>
+                    )}
+
                     {/* Auto-upgraded info banner */}
                     {autoUpgraded && (
                         <div

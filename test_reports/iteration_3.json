@@ -1,0 +1,58 @@
+{
+  "summary": "Backend-only testing of News-Blackout filter feature. Created /app/backend/tests/test_news_blackout.py with 19 tests covering: ForexFactory calendar feed (/api/calendar/events structure + filters + only_scheduled), /api/calendar/blackout (structure, next_event.minutes_until, window validation), /api/analysis/ai news_blackout payload (filter off → {filter_enabled:false,in_blackout:false}; filter on → full status echo with window_minutes), cache key separation by both nb<0|1> and bw<N> flags, AISignal serialization with the new Optional[Dict] news_blackout field, and full regression on /api/market/quote, /api/market/candles, /api/analysis/indicators, /api/signals/history, /api/signals/stats, /api/news, /api/ea/signal, /api/ea/download. Combined run with prior test_xauusd_api.py: 27 passed in 4.55s. The override path was successfully exercised live at blackout_window=120 — FOMC speaker event matched _is_gold_sensitive via title keyword, original rule action=SELL was correctly overridden to action=HOLD with confidence halved (88→44), summary prefixed 'BLACKOUT —', and news_blackout.overridden_from='SELL'. Behavior matches spec exactly.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "/api/analysis/ai?blackout_window=240",
+        "issue": "The review request spec mentions blackout_window=240/1440 as the 'wide window to catch an event' test, but the endpoint enforces ge=0,le=120 on blackout_window (line 942 in server.py). Sending 240 returns HTTP 422. This is a spec/implementation mismatch — either the doc/test plan should say le=120, or the bound should be raised (e.g., le=480 or le=1440) so override-path testing is reliably reproducible regardless of when in the week the test runs. We worked around by using 120 (which happened to catch an FOMC speaker event)."
+      },
+      {
+        "endpoint": "/api/calendar/events (impact filter)",
+        "issue": "Some entries in the upstream feed have impact='Holiday' which is not in the documented 'Low|Medium|High' enum. Not a bug — just permissive — but worth either documenting the extra value or normalizing it server-side."
+      },
+      {
+        "endpoint": "/api/analysis/ai (TwelveData)",
+        "issue": "(carried from iteration 1+2) TwelveData 429 still leaks as HTTP 500 with no Retry-After. Not exercised in this run but remains a latent UX issue during free-tier quota windows."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_news_blackout.py",
+    "/app/backend/tests/test_xauusd_api.py",
+    "/app/backend/tests/test_auto_upgrade.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Minor) Raise upper bound on `blackout_window` Query param from le=120 to le=480 (or 1440) so QA / users can preview override behavior outside ±2h. Current bound makes the override path non-deterministically testable.",
+    "(Optional, low) Document or normalize the extra 'Holiday' value for ForexFactory event `impact` field — the API currently passes it through verbatim."
+  ],
+  "critical_code_review_comments": [
+    "server.py:944 — cache_key f'ai:{engine}:au{int(auto_upgrade)}:nb{int(news_blackout)}:bw{blackout_window}:{interval}' correctly includes both nb and bw → no cache bleed between (off↔on) and across different blackout_window values. Verified empirically (different `id` per slot).",
+    "server.py:1090-1117 — News-blackout override logic is sound: only fires when filter_enabled AND in_blackout AND action ∈ {BUY,SELL}; confidence floor (max 20, half of original) prevents accidental zero; summary is prefixed 'BLACKOUT — ' and embeds event title + minutes_until; original reasoning is preserved (appended after the blackout explanation). Override path observed live during test.",
+    "server.py:1593-1598 — _is_gold_sensitive() correctly handles both (a) USD High-impact and (b) USD events whose title matches HIGH_PRIORITY_TITLES (FOMC/NFP/CPI etc.) even when upstream impact is 'Low' (FOMC speaker case verified live).",
+    "server.py:1538-1591 — ForexFactory fetch has 30-min cache + stale fallback on network error; ET→UTC conversion via ZoneInfo is correct; non-scheduled labels ('All Day', 'Tentative', '') are parsed to when_utc=None with scheduled=False as documented.",
+    "server.py:1654 — /api/calendar/blackout enforces window_minutes ge=0,le=120. Same bound on /api/analysis/ai blackout_window — see action item.",
+    "server.py:319 — AISignal model: `news_blackout: Optional[Dict[str, Any]] = None` is the right shape; both off-mode (small dict) and on-mode (full status dict) serialize without 500.",
+    "server.py:1099-1115 — minutes_until phrasing handles past/future/now correctly ('in N min', 'N min ago', 'now') and uses abs() so the readable message never goes negative — good UX touch.",
+    "server.py overall — file now 2083 lines; calendar/blackout block (~150 lines) is self-contained and could move to a `backend/services/calendar.py` module on next refactor pass."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_news_blackout.py (new)"
+  ],
+  "success_rate": {
+    "backend": "100% (27/27 passed across test_news_blackout.py + test_xauusd_api.py)",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "N/A — public API, no auth",
+  "seed_data_creation": "Multiple AI signals inserted into ai_signals collection with the new news_blackout field populated (both filter-off and filter-on variants, including one override BLACKOUT signal where overridden_from='SELL'). ForexFactory weekly XML cached in backend in-memory cache.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "blackout_window upper bound is 120 (not 240/1440 as the original spec suggested). At the time of this test, the override path was reachable at blackout_window=120 because an FOMC speaker event was within ±120min (matched via title keyword). On a different day this may not be the case — if test_filter_on_max_window_override_path skips/fails, that's expected (no event in window), not a regression. Cache TTLs unchanged: 60s rule / 180s ai. Cache key format: 'ai:{engine}:au{0|1}:nb{0|1}:bw{N}:{interval}'. ForexFactory feed cached 30 min with stale fallback. Frontend (Dashboard.jsx, AISignalCard.jsx, api.js) not tested.",
+  "rca of the issue": "No bugs found in the targeted News-Blackout feature. All spec requirements validated: (1) calendar feed structure + filters work; (2) blackout endpoint returns correct shape with valid minutes_until; (3) AI endpoint payload differs correctly between filter off/on; (4) override fires correctly (HOLD, halved confidence, BLACKOUT summary, overridden_from set) when in_blackout=True AND rule action ∈ {BUY,SELL}; (5) cache key separation by nb and bw verified via distinct response IDs; (6) AISignal model serializes news_blackout field without 500; (7) all regression endpoints healthy. The only minor finding is the spec↔code discrepancy on blackout_window upper bound (120 vs 240/1440)."
+}
