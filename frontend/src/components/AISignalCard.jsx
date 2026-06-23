@@ -3,6 +3,7 @@ import {
     TrendingUp, TrendingDown, Minus, Sparkles, RefreshCw, Loader2,
     Clock, Shield, Newspaper, DollarSign, Layers, Activity,
     CheckCircle2, AlertTriangle, XCircle, Bot, Zap, Scale, Gavel,
+    Flame, ShieldCheck, Briefcase,
 } from "lucide-react";
 
 function fmt(n, d = 2) {
@@ -478,6 +479,11 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
                         <CouncilDebate council={council} />
                     )}
 
+                    {/* Risk Team (Aggressive / Neutral / Conservative + Manager) */}
+                    {council?.risk_team && (
+                        <RiskTeamPanel riskTeam={council.risk_team} />
+                    )}
+
                     {/* Analysis steps */}
                     {steps && (
                         <div className="border-t border-[#262626] pt-3">
@@ -638,6 +644,166 @@ function CouncilDebate({ council }) {
                             <div className="text-[10px] font-mono text-[#FF2A55]/70 mt-1.5 italic">
                                 ★ {bear.strongest_factor}
                             </div>
+                        )}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+
+const VOTE_STYLE = {
+    APPROVE: { fg: "#00B86B", label: "APPROVE" },
+    APPROVE_REDUCED: { fg: "#D4AF37", label: "APPROVE (REDUCED)" },
+    REJECT: { fg: "#FF2A55", label: "REJECT" },
+};
+
+const DECISION_STYLE = {
+    AUTHORIZE: { fg: "#00B86B", border: "#00B86B", bg: "rgba(0,184,107,0.08)", label: "AUTHORIZED" },
+    AUTHORIZE_MODIFIED: { fg: "#D4AF37", border: "#D4AF37", bg: "rgba(212,175,55,0.08)", label: "AUTHORIZED (MODIFIED)" },
+    REJECT: { fg: "#FF2A55", border: "#FF2A55", bg: "rgba(255,42,85,0.10)", label: "REJECTED" },
+};
+
+const ROLE_META = {
+    aggressive: { icon: Flame, fg: "#FF8A33", label: "Aggressive", model: "Gemini" },
+    neutral: { icon: Scale, fg: "#7AB8FF", label: "Neutral", model: "Claude" },
+    conservative: { icon: ShieldCheck, fg: "#5BE3C7", label: "Conservative", model: "Gemini" },
+};
+
+function RiskRoleCard({ role, data }) {
+    const meta = ROLE_META[role] || { icon: Shield, fg: "#999", label: role, model: "" };
+    const Icon = meta.icon;
+    const voteStyle = VOTE_STYLE[String(data?.vote || "").toUpperCase()] || VOTE_STYLE.APPROVE_REDUCED;
+    return (
+        <div
+            className="border rounded-sm p-2.5"
+            style={{ borderColor: `${meta.fg}40`, background: `${meta.fg}0D` }}
+            data-testid={`risk-${role}-card`}
+        >
+            <div className="flex items-center justify-between mb-1.5 gap-2">
+                <div className="text-[10px] font-mono uppercase tracking-[0.15em] flex items-center gap-1" style={{ color: meta.fg }}>
+                    <Icon className="w-3 h-3" /> {meta.label} <span className="text-gray-600 ml-0.5">· {meta.model}</span>
+                </div>
+                <span
+                    className="text-[10px] font-mono uppercase tracking-[0.1em] px-1.5 py-0.5 rounded-sm whitespace-nowrap"
+                    style={{ color: voteStyle.fg, border: `1px solid ${voteStyle.fg}55` }}
+                    data-testid={`risk-${role}-vote`}
+                >
+                    {voteStyle.label} · {Number(data?.recommended_size_pct || 0).toFixed(1)}%
+                </span>
+            </div>
+            {data?.stance && (
+                <p className="text-xs text-gray-300 leading-snug mb-1.5">{data.stance}</p>
+            )}
+            {(data?.key_concerns || []).length > 0 && (
+                <ul className="text-[11px] text-gray-400 space-y-1 list-disc list-inside leading-snug">
+                    {data.key_concerns.slice(0, 3).map((c, i) => (
+                        <li key={i}>{c}</li>
+                    ))}
+                </ul>
+            )}
+            {data?.size_rationale && (
+                <div className="text-[10px] font-mono mt-1.5 italic" style={{ color: `${meta.fg}b3` }}>
+                    ★ {data.size_rationale}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function RiskTeamPanel({ riskTeam }) {
+    const [open, setOpen] = useState(true);
+    const mgr = riskTeam?.manager || {};
+    const decisionKey = String(mgr.decision || "AUTHORIZE").toUpperCase();
+    const ds = DECISION_STYLE[decisionKey] || DECISION_STYLE.AUTHORIZE;
+
+    return (
+        <div className="border-t border-[#262626] pt-3" data-testid="risk-team-panel">
+            <button
+                onClick={() => setOpen((o) => !o)}
+                className="w-full flex items-center justify-between mb-2 group"
+                data-testid="risk-team-toggle-btn"
+            >
+                <div className="text-[10px] font-mono uppercase tracking-[0.2em] flex items-center gap-1.5" style={{ color: ds.fg }}>
+                    <Briefcase className="w-3 h-3" />
+                    Risk Team · Manager
+                </div>
+                <div className="flex items-center gap-2">
+                    <span
+                        className="text-[10px] font-mono uppercase tracking-[0.15em] px-1.5 py-0.5 rounded-sm font-bold"
+                        style={{ color: ds.fg, border: `1px solid ${ds.fg}`, background: ds.bg }}
+                        data-testid="manager-decision-badge"
+                    >
+                        {ds.label}
+                    </span>
+                    <span className="text-[10px] font-mono text-gray-500 group-hover:text-white">
+                        {open ? "−" : "+"}
+                    </span>
+                </div>
+            </button>
+
+            {open && (
+                <div className="space-y-2">
+                    <RiskRoleCard role="aggressive" data={riskTeam.aggressive} />
+                    <RiskRoleCard role="neutral" data={riskTeam.neutral} />
+                    <RiskRoleCard role="conservative" data={riskTeam.conservative} />
+
+                    {/* Manager box */}
+                    <div
+                        className="border-2 rounded-sm p-3"
+                        style={{ borderColor: ds.border, background: ds.bg }}
+                        data-testid="manager-card"
+                    >
+                        <div className="flex items-center justify-between mb-2 gap-2">
+                            <div className="text-[10px] font-mono uppercase tracking-[0.2em] flex items-center gap-1.5" style={{ color: ds.fg }}>
+                                <Gavel className="w-3.5 h-3.5" /> Portfolio Manager · Claude
+                            </div>
+                            {mgr.tilt && (
+                                <span className="text-[10px] font-mono uppercase tracking-[0.15em] text-gray-400">
+                                    Tilt · <span style={{ color: ds.fg }}>{mgr.tilt}</span>
+                                </span>
+                            )}
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-2 mb-2">
+                            <div className="bg-[#0F0F0F] border border-[#262626] p-1.5 rounded-sm">
+                                <div className="text-[9px] font-mono text-gray-500 uppercase tracking-[0.1em]">Final Action</div>
+                                <div className="font-mono font-bold text-sm" style={{ color: ds.fg }} data-testid="manager-final-action">
+                                    {mgr.final_action || "—"}
+                                </div>
+                            </div>
+                            <div className="bg-[#0F0F0F] border border-[#262626] p-1.5 rounded-sm">
+                                <div className="text-[9px] font-mono text-gray-500 uppercase tracking-[0.1em]">Size · Risk</div>
+                                <div className="font-mono font-bold text-sm text-white" data-testid="manager-size">
+                                    {Number(mgr.position_size_pct || 0).toFixed(2)}%
+                                </div>
+                            </div>
+                            <div className="bg-[#0F0F0F] border border-[#262626] p-1.5 rounded-sm">
+                                <div className="text-[9px] font-mono text-[#FF2A55] uppercase tracking-[0.1em]">Final SL</div>
+                                <div className="font-mono font-bold text-sm text-[#FF2A55]" data-testid="manager-final-sl">
+                                    {mgr.final_sl ? Number(mgr.final_sl).toFixed(2) : "—"}
+                                </div>
+                            </div>
+                        </div>
+
+                        {mgr.rationale && (
+                            <p className="text-xs text-gray-300 leading-snug mb-1.5" data-testid="manager-rationale">
+                                {mgr.rationale}
+                            </p>
+                        )}
+
+                        {(mgr.modifications || []).length > 0 && (
+                            <>
+                                <div className="text-[9px] font-mono uppercase tracking-[0.15em] mt-2 mb-1" style={{ color: ds.fg }}>
+                                    Modifications applied
+                                </div>
+                                <ul className="text-[11px] text-gray-400 space-y-1 list-disc list-inside leading-snug">
+                                    {mgr.modifications.slice(0, 4).map((m, i) => (
+                                        <li key={i}>{m}</li>
+                                    ))}
+                                </ul>
+                            </>
                         )}
                     </div>
                 </div>

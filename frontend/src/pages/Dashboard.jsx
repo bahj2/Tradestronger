@@ -32,15 +32,18 @@ export default function Dashboard() {
     const [strongOnly, setStrongOnly] = useState(false);
     const [newsBlackout, setNewsBlackout] = useState(true);
     const [blackoutWindow] = useState(15);
+    const [withRiskTeam, setWithRiskTeam] = useState(false);
 
     const refresh = () => setRefreshKey((k) => k + 1);
 
     const loadAI = useCallback(async (forceEngine) => {
         const useEngine = forceEngine || engine;
+        // Only meaningful when running council; ignored otherwise by backend
+        const useRiskTeam = useEngine === "council" && withRiskTeam;
         setAiLoading(true);
         setAiError(null);
         try {
-            const s = await fetchAISignal(interval, useEngine, autoUpgrade, newsBlackout, blackoutWindow);
+            const s = await fetchAISignal(interval, useEngine, autoUpgrade, newsBlackout, blackoutWindow, useRiskTeam);
             setAiSignal(s);
             if (forceEngine) setEngine(forceEngine);
         } catch (e) {
@@ -49,7 +52,7 @@ export default function Dashboard() {
         } finally {
             setAiLoading(false);
         }
-    }, [interval, engine, autoUpgrade, newsBlackout, blackoutWindow]);
+    }, [interval, engine, autoUpgrade, newsBlackout, blackoutWindow, withRiskTeam]);
 
     useEffect(() => {
         document.title = "AURUM TERMINAL — XAU/USD Pro Analytics";
@@ -139,6 +142,19 @@ export default function Dashboard() {
                             className="accent-[#D4AF37] cursor-pointer"
                         />
                         News Blackout
+                    </label>
+                    <label
+                        className="hidden md:flex items-center gap-1.5 text-[10px] font-mono text-gray-400 uppercase tracking-[0.15em] cursor-pointer select-none"
+                        title="When ON: Council adds a 3-role Risk Team (Aggressive/Neutral/Conservative) + Manager final authorization. Costs +4 LLM calls (~10¢ extra)."
+                    >
+                        <input
+                            type="checkbox"
+                            data-testid="risk-team-toggle"
+                            checked={withRiskTeam}
+                            onChange={(e) => setWithRiskTeam(e.target.checked)}
+                            className="accent-[#A855F7] cursor-pointer"
+                        />
+                        + Risk Team
                     </label>
                     <label
                         className="hidden md:flex items-center gap-1.5 text-[10px] font-mono text-gray-400 uppercase tracking-[0.15em] cursor-pointer select-none"

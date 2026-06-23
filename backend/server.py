@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -874,23 +874,21 @@ async def _run_single_ai(provider: str, model: str, prompt: str, label: str) -> 
 
 def _build_bull_prompt(base_prompt: str, baseline: dict) -> str:
     return f"""You are the BULL RESEARCHER on a XAU/USD trading desk.
-Your job: build the strongest possible BUY case from the data — even if the market leans bearish, argue why a long is justified or why we should NOT short here. Be honest, not sycophantic.
+Argue the strongest BUY case from the data — even if market leans bearish. Be honest, concise.
 
-═══ ALL MARKET INPUTS ═══
+═══ MARKET INPUTS ═══
 {base_prompt}
 
-═══ DETERMINISTIC RULE-ENGINE BASELINE ═══
+═══ RULE-ENGINE BASELINE ═══
 Action: {baseline.get('action')}, Confidence: {baseline.get('confidence')}, Strength: {baseline.get('signal_strength')}
-Verdict: {baseline.get('summary')}
 
-═══ YOUR TASK ═══
-Output STRICT JSON only:
+Output STRICT JSON only (be concise — response must complete in <20s):
 {{
   "stance": "BULLISH" | "NEUTRAL_BULL",
-  "thesis": "1-paragraph case (3-5 sentences) for going LONG / not shorting",
-  "key_points": ["bullet 1", "bullet 2", "bullet 3", "bullet 4"],
-  "strongest_factor": "the single most compelling bullish piece of evidence",
-  "weakness_in_my_case": "the biggest hole in the bullish argument that the bear will exploit",
+  "thesis": "2-3 sentence case for LONG / not shorting",
+  "key_points": ["b1", "b2", "b3"],
+  "strongest_factor": "the single most compelling bullish piece (1 line)",
+  "weakness_in_my_case": "biggest hole in bull argument (1 line)",
   "confidence_in_buy": 0-100
 }}
 No markdown, no preamble.""".strip()
@@ -899,40 +897,32 @@ No markdown, no preamble.""".strip()
 def _build_bear_prompt(base_prompt: str, baseline: dict, bull_thesis: dict) -> str:
     has_bull = bool(bull_thesis and bull_thesis.get("thesis"))
     if has_bull:
-        bull_points = "\n".join(f"  - {p}" for p in (bull_thesis.get("key_points") or [])[:5])
-        bull_block = f"""═══ BULL'S THESIS (rebut this) ═══
-Stance: {bull_thesis.get('stance')}
-Confidence in BUY: {bull_thesis.get('confidence_in_buy')}
-Thesis: {bull_thesis.get('thesis')}
-Strongest factor: {bull_thesis.get('strongest_factor')}
-Bull's key points:
-{bull_points or '  (none)'}
-
-═══ YOUR TASK ═══
-Counter the bull with hard evidence."""
+        bull_points = "\n".join(f"  - {p}" for p in (bull_thesis.get("key_points") or [])[:3])
+        bull_block = f"""═══ BULL'S THESIS (rebut briefly) ═══
+{bull_thesis.get('thesis', '')[:240]}
+{bull_points or ''}"""
     else:
-        bull_block = """═══ YOUR TASK ═══
-Build the strongest possible BEARISH case from the market data alone. Imagine a hypothetical bull who would point at: RSI oversold bouncing, mean reversion, safe-haven demand, geopolitical premium. Address those preemptively in your rebuttals."""
+        bull_block = "═══ TASK CONTEXT ═══\nBuild the strongest BEARISH case from market data. Address typical bullish counterpoints (oversold RSI, mean-reversion, safe-haven)."
 
     return f"""You are the BEAR RESEARCHER on a XAU/USD trading desk.
-Your job: build the SHORT case (or argue HOLD if neither side dominates).
+Argue the strongest SHORT case (or HOLD if unclear). Be honest, concise.
 
-═══ ALL MARKET INPUTS ═══
+═══ MARKET INPUTS ═══
 {base_prompt}
 
 ═══ RULE-ENGINE BASELINE ═══
-Action: {baseline.get('action')}, Confidence: {baseline.get('confidence')}, Strength: {baseline.get('signal_strength')}
+Action: {baseline.get('action')}, Strength: {baseline.get('signal_strength')}
 
 {bull_block}
 
-Output STRICT JSON only:
+Output STRICT JSON only (be concise — response must complete in <20s):
 {{
   "stance": "BEARISH" | "NEUTRAL_BEAR",
-  "rebuttals": ["counter to typical bullish argument 1", "counter 2", "counter 3"],
-  "thesis": "1-paragraph case (3-5 sentences) for going SHORT or staying flat",
-  "key_points": ["independent bearish bullet 1", "bullet 2", "bullet 3", "bullet 4"],
-  "strongest_factor": "the single most compelling bearish piece of evidence",
-  "weakness_in_my_case": "biggest hole in the bearish argument",
+  "rebuttals": ["r1", "r2", "r3"],
+  "thesis": "2-3 sentence case for SHORT or HOLD",
+  "key_points": ["b1", "b2", "b3"],
+  "strongest_factor": "single most compelling bearish piece (1 line)",
+  "weakness_in_my_case": "biggest hole (1 line)",
   "confidence_in_sell": 0-100
 }}
 No markdown, no preamble.""".strip()
@@ -1026,6 +1016,136 @@ async def _run_council_debate(
     return trader, bull, bear
 
 
+# ───────── Risk Team Layer (TradingAgents-style: 3 risk perspectives + Manager) ─────────
+def _build_trader_plus_risk_manager_prompt(base_prompt: str, baseline: dict, bull: dict, bear: dict) -> str:
+    """Combined Trader + Risk Team + Manager prompt — one LLM call produces all 5 voices.
+    Saves 2 LLM round-trips, keeps total council+risk under Cloudflare's 60s edge timeout."""
+    return f"""You are running a 5-role trading desk for XAU/USD. You watched the Bull and Bear Researchers debate, and now you must roleplay FIVE DISTINCT voices honestly and emit ONE combined JSON response:
+
+  1) 💼 HEAD TRADER — picks a side from the debate, drafts entry/SL/TP using ATR-aware risk
+  2) 🔥 AGGRESSIVE RISK MANAGER — favors growth, larger size on STRONG signals
+  3) ⚖ NEUTRAL RISK MANAGER — textbook 1-2% risk, scales with confidence
+  4) 🛡 CONSERVATIVE RISK MANAGER — capital preservation first, default HOLD when unclear
+  5) 👔 PORTFOLIO MANAGER — final authority, synthesizes votes, commits position size
+
+Be true to each role. Do not have them agree to be polite.
+
+═══ MARKET INPUTS ═══
+{base_prompt}
+
+═══ RULE-ENGINE BASELINE ═══
+Action: {baseline.get('action')}, Confidence: {baseline.get('confidence')}, Strength: {baseline.get('signal_strength')}
+Suggested Entry: {baseline.get('entry')}, SL: {baseline.get('stop_loss')}, TP1/2/3: {baseline.get('tp1')}/{baseline.get('tp2')}/{baseline.get('tp3')}
+SL distance source: {baseline.get('sl_method')}
+
+═══ RESEARCHER DEBATE ═══
+🐂 BULL ({bull.get('confidence_in_buy', 'n/a')}% conf BUY): {str(bull.get('thesis', ''))[:260]}
+   Strongest factor: {bull.get('strongest_factor')}
+
+🐻 BEAR ({bear.get('confidence_in_sell', 'n/a')}% conf SELL): {str(bear.get('thesis', ''))[:260]}
+   Strongest factor: {bear.get('strongest_factor')}
+
+═══ TRADER CONFIDENCE CALIBRATION ═══
+- 80-100: one side demolished the other → VERY_STRONG
+- 65-80: clearly winning argument despite valid counter → STRONG
+- 50-65: leans one way but both sides have merit → MODERATE
+- <50: stalemate → WEAK → prefer HOLD
+
+═══ MANAGER DECISION RULES ═══
+- 2+ risk REJECTs → final = REJECT (action=HOLD, size=0)
+- 1 REJECT + others APPROVE → reduce size to between Neutral's and Conservative's
+- All APPROVE → use Neutral's size (or trader's confidence-weighted)
+- Position size MUST stay 0% ≤ size ≤ 2%
+- May tighten SL but NEVER widen beyond trader's SL
+
+Return STRICT JSON only (no markdown, no preamble). Keep all text fields CONCISE — the response must complete in <30 seconds.
+{{
+  "trader": {{
+    "action": "BUY" | "SELL" | "HOLD",
+    "confidence": 0-100,
+    "signal_strength": "WEAK" | "MODERATE" | "STRONG" | "VERY_STRONG",
+    "winner": "BULL" | "BEAR" | "TIE",
+    "entry": float, "stop_loss": float, "take_profit": float,
+    "tp1": float, "tp2": float, "tp3": float,
+    "risk_reward": float, "valid_for_minutes": integer,
+    "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
+    "higher_tf_trend": "BULLISH" | "BEARISH" | "NEUTRAL",
+    "lower_tf_momentum": "BULLISH" | "BEARISH" | "NEUTRAL",
+    "news_sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
+    "summary": "<=18 words punchy verdict",
+    "reasoning": "2-3 sentences max",
+    "analysis_steps": {{
+      "trend": "<=15 words", "momentum": "<=15 words",
+      "news": "<=15 words", "macro": "<=15 words",
+      "verdict": "<=20 words"
+    }}
+  }},
+  "aggressive": {{
+    "role": "AGGRESSIVE",
+    "vote": "APPROVE" | "APPROVE_REDUCED" | "REJECT",
+    "recommended_size_pct": 0.0-3.0,
+    "stance": "1-2 sentences",
+    "key_concerns": ["c1", "c2"],
+    "size_rationale": "1 sentence"
+  }},
+  "neutral": {{
+    "role": "NEUTRAL",
+    "vote": "APPROVE" | "APPROVE_REDUCED" | "REJECT",
+    "recommended_size_pct": 0.0-2.0,
+    "stance": "1-2 sentences",
+    "key_concerns": ["c1", "c2"],
+    "size_rationale": "1 sentence"
+  }},
+  "conservative": {{
+    "role": "CONSERVATIVE",
+    "vote": "APPROVE" | "APPROVE_REDUCED" | "REJECT",
+    "recommended_size_pct": 0.0-1.0,
+    "stance": "1-2 sentences",
+    "key_concerns": ["c1", "c2"],
+    "size_rationale": "1 sentence"
+  }},
+  "manager": {{
+    "decision": "AUTHORIZE" | "AUTHORIZE_MODIFIED" | "REJECT",
+    "final_action": "BUY" | "SELL" | "HOLD",
+    "position_size_pct": 0.0-2.0,
+    "final_entry": float, "final_sl": float,
+    "final_tp1": float, "final_tp2": float, "final_tp3": float,
+    "rationale": "2-3 sentences citing risk votes by name",
+    "modifications": ["<=1 item, optional"],
+    "tilt": "AGGRESSIVE" | "NEUTRAL" | "CONSERVATIVE"
+  }}
+}}""".strip()
+
+
+async def _run_trader_with_risk(
+    base_prompt: str,
+    baseline: dict,
+    bull: dict,
+    bear: dict,
+) -> tuple[Optional[dict], Optional[dict]]:
+    """Single combined LLM call producing Trader verdict + all 3 risk perspectives + Manager.
+    Returns (trader_verdict, risk_team_dict). Either may be None on failure."""
+    prompt = _build_trader_plus_risk_manager_prompt(base_prompt, baseline, bull, bear)
+    parsed = await _run_single_ai(
+        "anthropic", "claude-sonnet-4-5-20250929", prompt, "trader-risk"
+    )
+    if not parsed:
+        return None, None
+    if "trader" not in parsed:
+        logging.warning(f"Combined trader+risk response missing 'trader' key: {list(parsed.keys())}")
+        return None, None
+    trader = parsed["trader"]
+    risk_team = None
+    if all(k in parsed for k in ("aggressive", "neutral", "conservative", "manager")):
+        risk_team = {
+            "aggressive": parsed["aggressive"],
+            "neutral": parsed["neutral"],
+            "conservative": parsed["conservative"],
+            "manager": parsed["manager"],
+        }
+    return trader, risk_team
+
+
 def _compute_consensus(claude_parsed: Optional[dict], gpt_parsed: Optional[dict]) -> tuple[str, dict, List[AIVote]]:
     """Return (consensus_label, chosen_signal_dict, votes_list)."""
     votes: List[AIVote] = []
@@ -1089,18 +1209,72 @@ def _compute_consensus(claude_parsed: Optional[dict], gpt_parsed: Optional[dict]
     return "CONFLICTED", chosen, votes
 
 
-@api_router.get("/analysis/ai", response_model=AISignal)
+@api_router.get("/analysis/ai")
 async def get_ai_signal(
     interval: str = Query("1h"),
     engine: str = Query("rule"),  # "rule" (free, default) or "ai" (dual-LLM)
     auto_upgrade: bool = Query(False),  # When engine=rule and signal is STRONG, auto-escalate to dual-LLM
     news_blackout: bool = Query(False),  # If True, override BUY/SELL to HOLD when inside a high-impact USD news window
     blackout_window: int = Query(15, ge=0, le=480),  # ± minutes around event (up to 8h for FOMC-day avoidance)
+    with_risk_team: bool = Query(False),  # Only meaningful when engine="council" — adds Aggressive/Neutral/Conservative + Manager layer
 ):
-    cache_key = f"ai:{engine}:au{int(auto_upgrade)}:nb{int(news_blackout)}:bw{blackout_window}:{interval}"
-    cached = _cache_get(cache_key, ttl_seconds=180 if engine == "ai" else 60)
+    # Council + Risk Team can take 45-80s — wrap in streaming heartbeat to survive Cloudflare 60s edge timeout.
+    # Heartbeat is whitespace prefix (valid JSON) so the frontend can parse the full response as JSON.
+    needs_streaming = (engine == "council" and with_risk_team)
+
+    cache_key = f"ai:{engine}:au{int(auto_upgrade)}:nb{int(news_blackout)}:bw{blackout_window}:rt{int(with_risk_team)}:{interval}"
+    cached = _cache_get(cache_key, ttl_seconds=180 if engine in ("ai", "council") else 60)
     if cached:
+        if needs_streaming:
+            return StreamingResponse(
+                iter([json.dumps(cached.model_dump() if hasattr(cached, "model_dump") else cached)]),
+                media_type="application/json",
+            )
         return cached
+
+    if needs_streaming:
+        async def heartbeat_stream():
+            task = asyncio.create_task(_compute_ai_signal(
+                interval=interval, engine=engine, auto_upgrade=auto_upgrade,
+                news_blackout=news_blackout, blackout_window=blackout_window,
+                with_risk_team=with_risk_team, cache_key=cache_key,
+            ))
+            try:
+                while True:
+                    try:
+                        result = await asyncio.wait_for(asyncio.shield(task), timeout=8.0)
+                        break
+                    except asyncio.TimeoutError:
+                        yield b" "  # heartbeat = leading whitespace; JSON tolerates it
+            except Exception as e:
+                logging.exception(f"Council+risk stream failed: {e}")
+                err = {"detail": str(e) or "Council computation failed"}
+                yield json.dumps(err).encode()
+                return
+            try:
+                payload = result.model_dump() if hasattr(result, "model_dump") else result
+                yield json.dumps(payload).encode()
+            except Exception as e:
+                yield json.dumps({"detail": f"serialization failed: {e}"}).encode()
+
+        return StreamingResponse(heartbeat_stream(), media_type="application/json")
+
+    return await _compute_ai_signal(
+        interval=interval, engine=engine, auto_upgrade=auto_upgrade,
+        news_blackout=news_blackout, blackout_window=blackout_window,
+        with_risk_team=with_risk_team, cache_key=cache_key,
+    )
+
+
+async def _compute_ai_signal(
+    interval: str,
+    engine: str,
+    auto_upgrade: bool,
+    news_blackout: bool,
+    blackout_window: int,
+    with_risk_team: bool,
+    cache_key: str,
+) -> AISignal:
 
     # Primary timeframe inputs
     snapshot = await get_indicators(interval=interval)
@@ -1206,9 +1380,26 @@ async def get_ai_signal(
             higher_tf=higher_tf, lower_tf=lower_tf,
             dxy=dxy, news_titles=news_titles,
         )
-        trader_verdict, bull, bear = await _run_council_debate(base_prompt, baseline)
-        if trader_verdict is None:
-            raise HTTPException(status_code=502, detail="Council debate failed (one or more agents unavailable)")
+
+        if with_risk_team:
+            # Optimized path: Bull ∥ Bear (parallel) → single combined Trader+Risk+Manager call
+            # Total ~35-50s (stays under Cloudflare 60s edge timeout)
+            bull_prompt = _build_bull_prompt(base_prompt, baseline)
+            bear_prompt = _build_bear_prompt(base_prompt, baseline, {})
+            bull_task = _run_single_ai("anthropic", "claude-sonnet-4-5-20250929", bull_prompt, "bull")
+            bear_task = _run_single_ai("gemini", "gemini-3.1-pro-preview", bear_prompt, "bear")
+            bull, bear = await asyncio.gather(bull_task, bear_task)
+            if not bull or not bear:
+                raise HTTPException(status_code=502, detail="Council debate failed (Bull or Bear agent unavailable)")
+
+            trader_verdict, risk_outcome = await _run_trader_with_risk(base_prompt, baseline, bull, bear)
+            if trader_verdict is None:
+                raise HTTPException(status_code=502, detail="Combined Trader+Risk synthesis failed")
+        else:
+            trader_verdict, bull, bear = await _run_council_debate(base_prompt, baseline)
+            if trader_verdict is None:
+                raise HTTPException(status_code=502, detail="Council debate failed (one or more agents unavailable)")
+            risk_outcome = None
 
         # Preserve ATR sl_method from baseline for transparency
         trader_verdict.setdefault("sl_method", baseline.get("sl_method"))
@@ -1261,6 +1452,96 @@ async def get_ai_signal(
                 "confidence_in_sell": bear.get("confidence_in_sell"),
             },
         }
+
+        # Optional Risk Team layer (TradingAgents-style) — `risk_outcome` already computed above
+        if with_risk_team:
+            if risk_outcome:
+                mgr = risk_outcome["manager"]
+                council_debate["risk_team"] = {
+                    "aggressive": risk_outcome["aggressive"],
+                    "neutral": risk_outcome["neutral"],
+                    "conservative": risk_outcome["conservative"],
+                    "manager": mgr,
+                }
+
+                # Manager has final authority. Adjust the signal accordingly.
+                final_action = str(mgr.get("final_action") or trader_verdict.get("action") or "HOLD").upper()
+                decision = str(mgr.get("decision") or "AUTHORIZE").upper()
+
+                # Capture original (trader) values for transparency before overriding
+                pre_action = str(parsed.get("action", "HOLD")).upper()
+
+                # Apply manager overrides on prices when provided
+                for k_src, k_dst in [
+                    ("final_entry", "entry"),
+                    ("final_sl", "stop_loss"),
+                    ("final_tp1", "tp1"),
+                    ("final_tp2", "tp2"),
+                    ("final_tp3", "tp3"),
+                ]:
+                    v = mgr.get(k_src)
+                    if isinstance(v, (int, float)) and v > 0:
+                        parsed[k_dst] = float(v)
+
+                # If manager rejected → override to HOLD with explanation; if modified → keep but flag
+                if decision == "REJECT" or final_action == "HOLD":
+                    parsed["action"] = "HOLD"
+                    parsed["confidence"] = min(int(parsed.get("confidence", 50)), 40)
+                    parsed["signal_strength"] = "WEAK"
+                    parsed["summary"] = (
+                        f"MANAGER REJECTED — Trader proposed {pre_action}. "
+                        f"{(mgr.get('rationale') or '')[:200]}"
+                    )
+                else:
+                    # Authorized (possibly modified). Surface the position size in reasoning + tilt info.
+                    parsed["action"] = final_action
+                    parsed["summary"] = (
+                        f"AUTHORIZED · {final_action} · size {float(mgr.get('position_size_pct') or 0):.2f}% · "
+                        f"tilt {str(mgr.get('tilt') or 'NEUTRAL').title()} — {(mgr.get('rationale') or '')[:160]}"
+                    )
+
+                # Add manager + risk roles to the votes list
+                votes.extend([
+                    AIVote(
+                        model="Aggressive Risk Manager",
+                        model_id="risk_aggressive",
+                        action=("BUY" if str(risk_outcome["aggressive"].get("vote")) == "APPROVE" and final_action == "BUY"
+                                else "SELL" if str(risk_outcome["aggressive"].get("vote")) == "APPROVE" and final_action == "SELL"
+                                else "HOLD"),
+                        confidence=int(float(risk_outcome["aggressive"].get("recommended_size_pct") or 0) * 33),
+                        summary=str(risk_outcome["aggressive"].get("stance", ""))[:240],
+                        available=True,
+                    ),
+                    AIVote(
+                        model="Neutral Risk Manager",
+                        model_id="risk_neutral",
+                        action=("BUY" if str(risk_outcome["neutral"].get("vote")) == "APPROVE" and final_action == "BUY"
+                                else "SELL" if str(risk_outcome["neutral"].get("vote")) == "APPROVE" and final_action == "SELL"
+                                else "HOLD"),
+                        confidence=int(float(risk_outcome["neutral"].get("recommended_size_pct") or 0) * 33),
+                        summary=str(risk_outcome["neutral"].get("stance", ""))[:240],
+                        available=True,
+                    ),
+                    AIVote(
+                        model="Conservative Risk Manager",
+                        model_id="risk_conservative",
+                        action=("BUY" if str(risk_outcome["conservative"].get("vote")) == "APPROVE" and final_action == "BUY"
+                                else "SELL" if str(risk_outcome["conservative"].get("vote")) == "APPROVE" and final_action == "SELL"
+                                else "HOLD"),
+                        confidence=int(float(risk_outcome["conservative"].get("recommended_size_pct") or 0) * 33),
+                        summary=str(risk_outcome["conservative"].get("stance", ""))[:240],
+                        available=True,
+                    ),
+                    AIVote(
+                        model="Portfolio Manager",
+                        model_id="manager",
+                        action=final_action,
+                        confidence=int(parsed.get("confidence", 50)),
+                        summary=str(mgr.get("rationale", ""))[:240],
+                        available=True,
+                    ),
+                ])
+                consensus = "MANAGER_AUTHORIZED" if decision != "REJECT" else "MANAGER_REJECTED"
     else:
         if not EMERGENT_LLM_KEY:
             raise HTTPException(status_code=500, detail="LLM key not configured")

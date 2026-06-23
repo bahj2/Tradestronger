@@ -85,6 +85,19 @@
 - ✅ Frontend: 🏛 "Council" button (purple) next to Deep AI button; renders a beautiful collapsible "Council Debate" panel with green Bull card, red Bear card, and a winner badge
 - ✅ ATR-based SL/TP preserved from rule baseline for transparency
 - ✅ Cost: ~10-15¢ per call (3 LLM calls) — recommended for final go/no-go decisions before placing real trades
+
+### Phase 8 — Full Risk Team Layer (TradingAgents architecture) (✅ Complete — Feb 23, 2026)
+- ✅ Optional `with_risk_team=true` flag on `engine="council"` adds 3-role Risk Council + Portfolio Manager final authorization
+- ✅ Roles: 🔥 **Aggressive** (push for full size on STRONG signals) · ⚖ **Neutral** (textbook 1-2% risk) · 🛡 **Conservative** (capital preservation, default HOLD)
+- ✅ Each role votes APPROVE / APPROVE_REDUCED / REJECT with recommended position size %
+- ✅ 👔 **Portfolio Manager** (Claude Sonnet 4.5) synthesizes votes → AUTHORIZE / AUTHORIZE_MODIFIED / REJECT with final position size, may tighten SL, references votes by name
+- ✅ Manager decision rules: 2+ REJECTs → final REJECT; 1 REJECT → reduce size; size capped at 0-2% account risk
+- ✅ Single combined LLM call (Bull ∥ Bear parallel → Combined Trader+Risk+Manager) — total 3 LLM calls in 3 stages
+- ✅ Total latency ~50-58s through Cloudflare; uses **StreamingResponse with whitespace heartbeats** to keep connection alive past Cloudflare's 60s edge read-timeout
+- ✅ Frontend: "+ Risk Team" header toggle; collapsible Risk Team panel showing 3 role cards + Manager box with Final Action / Size / Final SL / rationale / modifications
+- ✅ Consensus label: `MANAGER_AUTHORIZED` or `MANAGER_REJECTED`
+- ✅ Cost: ~15-20¢ per call (3 LLM calls) — use sparingly before final trade execution
+- ✅ Live verification: Manager correctly split risk-team sizing (Aggressive 2.0% + Neutral 1.5% + Conservative 0.75% → final 1.25%) and tightened SL by 5.75 points to account for oversold bounce risk.
 - 📈 **Win rate now 57.1%** overall (was 0% pre-ATR). **1h timeframe: 100% win rate (6W/0L, +0.72R avg)** — best performing horizon.
 
 ## Backlog (P1)
