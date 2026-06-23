@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import {
     TrendingUp, TrendingDown, Minus, Sparkles, RefreshCw, Loader2,
     Clock, Shield, Newspaper, DollarSign, Layers, Activity,
-    CheckCircle2, AlertTriangle, XCircle, Bot, Zap,
+    CheckCircle2, AlertTriangle, XCircle, Bot, Zap, Scale, Gavel,
 } from "lucide-react";
 
 function fmt(n, d = 2) {
@@ -87,7 +87,7 @@ function StepRow({ icon: Icon, title, text, testId }) {
     );
 }
 
-export default function AISignalCard({ signal, loading, error, onRegenerate, onDeepAI, engine, confidenceThreshold = 0, strongOnly = false }) {
+export default function AISignalCard({ signal, loading, error, onRegenerate, onDeepAI, onCouncil, engine, confidenceThreshold = 0, strongOnly = false }) {
     const action = (signal?.action || "HOLD").toUpperCase();
     const style = actionStyle[action] || actionStyle.HOLD;
     const Icon = style.Icon;
@@ -116,6 +116,8 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
     const inBlackout = !!blackout?.in_blackout;
     const nextEvent = blackout?.next_event;
     const overriddenFrom = blackout?.overridden_from;
+    const council = signal?.council_debate;
+    const isCouncil = engine === "council" || !!council;
 
     return (
         <div
@@ -125,7 +127,14 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
         >
             <div className="flex items-center justify-between px-4 py-2 border-b border-[#262626]">
                 <div className="flex items-center gap-2">
-                    {engine === "ai" || autoUpgraded ? (
+                    {isCouncil ? (
+                        <>
+                            <Scale className="w-3.5 h-3.5 text-[#A855F7]" />
+                            <span className="text-[10px] font-mono text-[#A855F7] uppercase tracking-[0.2em]">
+                                Council · Bull vs Bear vs Trader
+                            </span>
+                        </>
+                    ) : engine === "ai" || autoUpgraded ? (
                         <>
                             <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
                             <span className="text-[10px] font-mono text-[#D4AF37] uppercase tracking-[0.2em]">
@@ -142,6 +151,18 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
                     )}
                 </div>
                 <div className="flex items-center gap-1.5">
+                    {onCouncil && (
+                        <button
+                            onClick={onCouncil}
+                            disabled={loading}
+                            data-testid="council-btn"
+                            title="Run a Bull vs Bear vs Trader debate (3 LLM calls, ~10-15¢)"
+                            className="text-[10px] font-mono uppercase tracking-[0.1em] px-2 py-1 border border-[#A855F7]/50 text-[#A855F7] hover:bg-[#A855F7]/10 rounded-sm transition-colors disabled:opacity-50 flex items-center gap-1"
+                        >
+                            <Scale className="w-3 h-3" />
+                            Council
+                        </button>
+                    )}
                     {onDeepAI && (
                         <button
                             onClick={onDeepAI}
@@ -452,6 +473,11 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
                         </div>
                     </div>
 
+                    {/* Council Debate transcript */}
+                    {council && (
+                        <CouncilDebate council={council} />
+                    )}
+
                     {/* Analysis steps */}
                     {steps && (
                         <div className="border-t border-[#262626] pt-3">
@@ -502,6 +528,118 @@ export default function AISignalCard({ signal, loading, error, onRegenerate, onD
                             </div>
                         </div>
                     )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function CouncilDebate({ council }) {
+    const [open, setOpen] = useState(true);
+    const bull = council?.bull || {};
+    const bear = council?.bear || {};
+    const winner = (council?.winner || "TIE").toUpperCase();
+    const winnerStyle = winner === "BULL"
+        ? { fg: "#00B86B", label: "Bull wins" }
+        : winner === "BEAR"
+            ? { fg: "#FF2A55", label: "Bear wins" }
+            : { fg: "#D4AF37", label: "Stalemate" };
+
+    return (
+        <div className="border-t border-[#262626] pt-3" data-testid="council-debate-panel">
+            <button
+                onClick={() => setOpen((o) => !o)}
+                className="w-full flex items-center justify-between mb-2 group"
+                data-testid="council-toggle"
+            >
+                <div className="text-[10px] font-mono text-[#A855F7] uppercase tracking-[0.2em] flex items-center gap-1.5">
+                    <Gavel className="w-3 h-3" />
+                    Council Debate
+                </div>
+                <div className="flex items-center gap-2">
+                    <span
+                        className="text-[10px] font-mono uppercase tracking-[0.15em] px-1.5 py-0.5 rounded-sm"
+                        style={{ color: winnerStyle.fg, border: `1px solid ${winnerStyle.fg}55` }}
+                        data-testid="council-winner-badge"
+                    >
+                        {winnerStyle.label}
+                    </span>
+                    <span className="text-[10px] font-mono text-gray-500 group-hover:text-[#A855F7]">
+                        {open ? "−" : "+"}
+                    </span>
+                </div>
+            </button>
+
+            {open && (
+                <div className="space-y-2">
+                    {/* BULL */}
+                    <div
+                        className="border border-[#00B86B]/30 bg-[#00B86B]/5 rounded-sm p-2.5"
+                        data-testid="council-bull-card"
+                    >
+                        <div className="flex items-center justify-between mb-1.5">
+                            <div className="text-[10px] font-mono text-[#00B86B] uppercase tracking-[0.2em] flex items-center gap-1">
+                                <TrendingUp className="w-3 h-3" /> Bull Researcher
+                            </div>
+                            {bull.confidence_in_buy != null && (
+                                <span className="text-[10px] font-mono text-[#00B86B]" data-testid="council-bull-conf">
+                                    Conf BUY · {bull.confidence_in_buy}%
+                                </span>
+                            )}
+                        </div>
+                        {bull.thesis && (
+                            <p className="text-xs text-gray-300 leading-snug mb-1.5">{bull.thesis}</p>
+                        )}
+                        {(bull.key_points || []).length > 0 && (
+                            <ul className="text-[11px] text-gray-400 space-y-1 list-disc list-inside leading-snug">
+                                {bull.key_points.slice(0, 4).map((p, i) => (
+                                    <li key={i}>{p}</li>
+                                ))}
+                            </ul>
+                        )}
+                        {bull.strongest_factor && (
+                            <div className="text-[10px] font-mono text-[#00B86B]/70 mt-1.5 italic">
+                                ★ {bull.strongest_factor}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* BEAR */}
+                    <div
+                        className="border border-[#FF2A55]/30 bg-[#FF2A55]/5 rounded-sm p-2.5"
+                        data-testid="council-bear-card"
+                    >
+                        <div className="flex items-center justify-between mb-1.5">
+                            <div className="text-[10px] font-mono text-[#FF2A55] uppercase tracking-[0.2em] flex items-center gap-1">
+                                <TrendingDown className="w-3 h-3" /> Bear Researcher
+                            </div>
+                            {bear.confidence_in_sell != null && (
+                                <span className="text-[10px] font-mono text-[#FF2A55]" data-testid="council-bear-conf">
+                                    Conf SELL · {bear.confidence_in_sell}%
+                                </span>
+                            )}
+                        </div>
+                        {bear.thesis && (
+                            <p className="text-xs text-gray-300 leading-snug mb-1.5">{bear.thesis}</p>
+                        )}
+                        {(bear.rebuttals || []).length > 0 && (
+                            <>
+                                <div className="text-[9px] font-mono text-[#FF2A55]/80 uppercase tracking-[0.15em] mt-1.5 mb-1">
+                                    Rebuttals to bull
+                                </div>
+                                <ul className="text-[11px] text-gray-400 space-y-1 list-disc list-inside leading-snug">
+                                    {bear.rebuttals.slice(0, 4).map((r, i) => (
+                                        <li key={i}>{r}</li>
+                                    ))}
+                                </ul>
+                            </>
+                        )}
+                        {bear.strongest_factor && (
+                            <div className="text-[10px] font-mono text-[#FF2A55]/70 mt-1.5 italic">
+                                ★ {bear.strongest_factor}
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
         </div>

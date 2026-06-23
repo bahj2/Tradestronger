@@ -19,7 +19,8 @@ export const fetchAISignal = (interval, engine = "rule", autoUpgrade = false, ne
             news_blackout: newsBlackout,
             blackout_window: blackoutWindow,
         },
-        timeout: 75000,  // Dual-LLM ensemble can take 30-60s; rule engine returns in <2s
+        // Council = 3 sequential LLM calls (~30-90s); Dual-AI ~30-60s; rule engine <2s
+        timeout: engine === "council" ? 150000 : 75000,
     }).then(r => r.data);
 export const fetchCalendarEvents = (params = {}) =>
     api.get("/calendar/events", { params }).then(r => r.data);

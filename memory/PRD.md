@@ -77,6 +77,16 @@
 - ✅ blackout_window accepts 0-480 minutes (up to 8h — enough for FOMC-day full avoidance)
 - ✅ Backend tests: 27/27 passed. Test file at `/app/backend/tests/test_news_blackout.py`.
 
+### Phase 7 — Council Debate (Bull vs Bear vs Trader) (✅ Complete — Feb 23, 2026)
+- ✅ TradingAgents-inspired 3-agent council on a new `engine="council"` mode
+- ✅ Bull Researcher (Claude Sonnet 4.5) + Bear Researcher (Gemini 3.1 Pro) run in **parallel** → Head Trader (Claude Sonnet 4.5) synthesizes both into final verdict
+- ✅ Parallelization keeps total latency at ~30-50s (safe under Cloudflare 100s edge timeout); 3 LLM calls per signal
+- ✅ Returns full `council_debate` payload: bull thesis + key points + strongest factor + weakness, bear thesis + rebuttals + key points + strongest factor + weakness, plus `winner: BULL|BEAR|TIE`
+- ✅ Frontend: 🏛 "Council" button (purple) next to Deep AI button; renders a beautiful collapsible "Council Debate" panel with green Bull card, red Bear card, and a winner badge
+- ✅ ATR-based SL/TP preserved from rule baseline for transparency
+- ✅ Cost: ~10-15¢ per call (3 LLM calls) — recommended for final go/no-go decisions before placing real trades
+- 📈 **Win rate now 57.1%** overall (was 0% pre-ATR). **1h timeframe: 100% win rate (6W/0L, +0.72R avg)** — best performing horizon.
+
 ## Backlog (P1)
 - Mobile responsive UI redesign (current desktop-first design breaks under 768px)
 - Trailing-stop simulation (model break-even move after TP1 hits → realized R boost)

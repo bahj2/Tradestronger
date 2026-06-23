@@ -210,6 +210,7 @@ export default function Dashboard() {
                         error={aiError}
                         onRegenerate={() => loadAI()}
                         onDeepAI={() => loadAI("ai")}
+                        onCouncil={() => loadAI("council")}
                         engine={engine}
                         confidenceThreshold={confidenceThreshold}
                         strongOnly={strongOnly}

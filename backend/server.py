@@ -317,6 +317,8 @@ class AISignal(BaseModel):
     auto_upgraded: bool = False
     # Economic-calendar blackout context (None when filter disabled)
     news_blackout: Optional[Dict[str, Any]] = None
+    # Bull-vs-Bear debate transcript (None unless engine="council")
+    council_debate: Optional[Dict[str, Any]] = None
 
 # ------------------- Routes -------------------
 @api_router.get("/")
@@ -870,6 +872,160 @@ async def _run_single_ai(provider: str, model: str, prompt: str, label: str) -> 
         return None
 
 
+def _build_bull_prompt(base_prompt: str, baseline: dict) -> str:
+    return f"""You are the BULL RESEARCHER on a XAU/USD trading desk.
+Your job: build the strongest possible BUY case from the data — even if the market leans bearish, argue why a long is justified or why we should NOT short here. Be honest, not sycophantic.
+
+═══ ALL MARKET INPUTS ═══
+{base_prompt}
+
+═══ DETERMINISTIC RULE-ENGINE BASELINE ═══
+Action: {baseline.get('action')}, Confidence: {baseline.get('confidence')}, Strength: {baseline.get('signal_strength')}
+Verdict: {baseline.get('summary')}
+
+═══ YOUR TASK ═══
+Output STRICT JSON only:
+{{
+  "stance": "BULLISH" | "NEUTRAL_BULL",
+  "thesis": "1-paragraph case (3-5 sentences) for going LONG / not shorting",
+  "key_points": ["bullet 1", "bullet 2", "bullet 3", "bullet 4"],
+  "strongest_factor": "the single most compelling bullish piece of evidence",
+  "weakness_in_my_case": "the biggest hole in the bullish argument that the bear will exploit",
+  "confidence_in_buy": 0-100
+}}
+No markdown, no preamble.""".strip()
+
+
+def _build_bear_prompt(base_prompt: str, baseline: dict, bull_thesis: dict) -> str:
+    has_bull = bool(bull_thesis and bull_thesis.get("thesis"))
+    if has_bull:
+        bull_points = "\n".join(f"  - {p}" for p in (bull_thesis.get("key_points") or [])[:5])
+        bull_block = f"""═══ BULL'S THESIS (rebut this) ═══
+Stance: {bull_thesis.get('stance')}
+Confidence in BUY: {bull_thesis.get('confidence_in_buy')}
+Thesis: {bull_thesis.get('thesis')}
+Strongest factor: {bull_thesis.get('strongest_factor')}
+Bull's key points:
+{bull_points or '  (none)'}
+
+═══ YOUR TASK ═══
+Counter the bull with hard evidence."""
+    else:
+        bull_block = """═══ YOUR TASK ═══
+Build the strongest possible BEARISH case from the market data alone. Imagine a hypothetical bull who would point at: RSI oversold bouncing, mean reversion, safe-haven demand, geopolitical premium. Address those preemptively in your rebuttals."""
+
+    return f"""You are the BEAR RESEARCHER on a XAU/USD trading desk.
+Your job: build the SHORT case (or argue HOLD if neither side dominates).
+
+═══ ALL MARKET INPUTS ═══
+{base_prompt}
+
+═══ RULE-ENGINE BASELINE ═══
+Action: {baseline.get('action')}, Confidence: {baseline.get('confidence')}, Strength: {baseline.get('signal_strength')}
+
+{bull_block}
+
+Output STRICT JSON only:
+{{
+  "stance": "BEARISH" | "NEUTRAL_BEAR",
+  "rebuttals": ["counter to typical bullish argument 1", "counter 2", "counter 3"],
+  "thesis": "1-paragraph case (3-5 sentences) for going SHORT or staying flat",
+  "key_points": ["independent bearish bullet 1", "bullet 2", "bullet 3", "bullet 4"],
+  "strongest_factor": "the single most compelling bearish piece of evidence",
+  "weakness_in_my_case": "biggest hole in the bearish argument",
+  "confidence_in_sell": 0-100
+}}
+No markdown, no preamble.""".strip()
+
+
+def _build_trader_judge_prompt(base_prompt: str, baseline: dict, bull: dict, bear: dict) -> str:
+    return f"""You are the HEAD TRADER. You just watched Bull vs Bear debate XAU/USD.
+Your job: pick a side (or HOLD), commit to actual numbers, and explain the call. Use ATR-aware SL/TP — wider on slower timeframes, tighter on faster ones.
+
+═══ MARKET INPUTS ═══
+{base_prompt}
+
+═══ RULE-ENGINE BASELINE ═══
+Action: {baseline.get('action')}, Confidence: {baseline.get('confidence')}, Strength: {baseline.get('signal_strength')}
+Suggested Entry: {baseline.get('entry')}, SL: {baseline.get('stop_loss')}, TP1/2/3: {baseline.get('tp1')}/{baseline.get('tp2')}/{baseline.get('tp3')}
+SL distance source: {baseline.get('sl_method')}
+
+═══ BULL CASE ═══
+Conf BUY: {bull.get('confidence_in_buy')}
+{bull.get('thesis')}
+Strongest factor: {bull.get('strongest_factor')}
+
+═══ BEAR CASE ═══
+Conf SELL: {bear.get('confidence_in_sell')}
+{bear.get('thesis')}
+Strongest factor: {bear.get('strongest_factor')}
+Rebuttals: {' | '.join(bear.get('rebuttals') or [])}
+
+═══ YOUR TASK ═══
+Be decisive. If one side clearly wins the debate, take it. If both have merit but conflict, output HOLD with HONEST low-MODERATE confidence.
+
+Confidence calibration:
+  - 80-100: bull (or bear) demolished the other side → VERY_STRONG
+  - 65-80: clearly winning argument despite valid counter → STRONG
+  - 50-65: leans one way but both sides have merit → MODERATE
+  - <50: stalemate / unclear → WEAK → prefer HOLD
+
+Keep entry close to current price. Honor the SL distance from the baseline (it's volatility-aware).
+
+Return STRICT JSON only (no markdown fences):
+{{
+  "action": "BUY" | "SELL" | "HOLD",
+  "confidence": 0-100 integer,
+  "signal_strength": "WEAK" | "MODERATE" | "STRONG" | "VERY_STRONG",
+  "winner": "BULL" | "BEAR" | "TIE",
+  "entry": float,
+  "stop_loss": float,
+  "take_profit": float,
+  "tp1": float, "tp2": float, "tp3": float,
+  "risk_reward": float,
+  "valid_for_minutes": integer,
+  "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "higher_tf_trend": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "lower_tf_momentum": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "news_sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "summary": "one-line punchy verdict referencing the debate (max 22 words)",
+  "reasoning": "3-5 sentence pro analysis citing why one side won (or both lost)",
+  "analysis_steps": {{
+    "trend": "MTF read",
+    "momentum": "indicator-based momentum",
+    "news": "news impact",
+    "macro": "DXY context",
+    "verdict": "why bull or bear won — be specific"
+  }}
+}}
+No markdown, no preamble.""".strip()
+
+
+async def _run_council_debate(
+    base_prompt: str,
+    baseline: dict,
+) -> tuple[Optional[dict], dict, dict]:
+    """Run Bull & Bear in PARALLEL, then Trader synthesizes both. Returns (trader_verdict, bull, bear).
+    Parallelizing Bull+Bear halves total latency to ~30-50s (stays under Cloudflare 100s edge timeout).
+    Trade-off: Bear can't directly rebut Bull's points, but Trader sees both theses and reconciles."""
+    bull_prompt = _build_bull_prompt(base_prompt, baseline)
+    # We pass an empty bull thesis to bear — bear builds its case from market data alone.
+    bear_prompt = _build_bear_prompt(base_prompt, baseline, {})
+
+    bull_task = _run_single_ai("anthropic", "claude-sonnet-4-5-20250929", bull_prompt, "bull")
+    bear_task = _run_single_ai("gemini", "gemini-3.1-pro-preview", bear_prompt, "bear")
+    bull, bear = await asyncio.gather(bull_task, bear_task)
+
+    if not bull or not bear:
+        return None, bull or {}, bear or {}
+
+    trader_prompt = _build_trader_judge_prompt(base_prompt, baseline, bull, bear)
+    trader = await _run_single_ai(
+        "anthropic", "claude-sonnet-4-5-20250929", trader_prompt, "trader"
+    )
+    return trader, bull, bear
+
+
 def _compute_consensus(claude_parsed: Optional[dict], gpt_parsed: Optional[dict]) -> tuple[str, dict, List[AIVote]]:
     """Return (consensus_label, chosen_signal_dict, votes_list)."""
     votes: List[AIVote] = []
@@ -966,6 +1122,7 @@ async def get_ai_signal(
     news_items = await _safe_news_items(limit=8)
 
     auto_upgraded = False
+    council_debate: Optional[Dict[str, Any]] = None
 
     # ===== Branch on engine =====
     if engine == "rule":
@@ -1034,6 +1191,76 @@ async def get_ai_signal(
                 available=True,
             )]
             consensus = "SINGLE_SOURCE"
+    elif engine == "council":
+        if not EMERGENT_LLM_KEY:
+            raise HTTPException(status_code=500, detail="LLM key not configured")
+        # Always run the rule engine first to get an ATR-based baseline (entry/SL/TPs)
+        baseline = _rule_engine_analyze(
+            snapshot, interval, higher_snap, lower_snap, dxy, news_titles,
+            candles=candles_resp.get('candles'),
+        )
+        base_prompt = _build_strong_prompt(
+            snapshot=snapshot, interval=interval,
+            recent_candles=candles_resp['candles'],
+            higher_snap=higher_snap, lower_snap=lower_snap,
+            higher_tf=higher_tf, lower_tf=lower_tf,
+            dxy=dxy, news_titles=news_titles,
+        )
+        trader_verdict, bull, bear = await _run_council_debate(base_prompt, baseline)
+        if trader_verdict is None:
+            raise HTTPException(status_code=502, detail="Council debate failed (one or more agents unavailable)")
+
+        # Preserve ATR sl_method from baseline for transparency
+        trader_verdict.setdefault("sl_method", baseline.get("sl_method"))
+        parsed = trader_verdict
+
+        votes = [
+            AIVote(
+                model="Bull Researcher (Claude)",
+                model_id="bull",
+                action="BUY",
+                confidence=int(bull.get("confidence_in_buy") or 50),
+                summary=str(bull.get("thesis", ""))[:240],
+                available=bool(bull),
+            ),
+            AIVote(
+                model="Bear Researcher (Gemini)",
+                model_id="bear",
+                action="SELL",
+                confidence=int(bear.get("confidence_in_sell") or 50),
+                summary=str(bear.get("thesis", ""))[:240],
+                available=bool(bear),
+            ),
+            AIVote(
+                model="Head Trader (Claude)",
+                model_id="trader",
+                action=str(trader_verdict.get("action", "HOLD")).upper(),
+                confidence=int(trader_verdict.get("confidence") or 50),
+                summary=str(trader_verdict.get("summary", ""))[:240],
+                available=True,
+            ),
+        ]
+        consensus = "COUNCIL_VERDICT"
+        council_debate = {
+            "winner": str(trader_verdict.get("winner") or "TIE").upper(),
+            "bull": {
+                "stance": bull.get("stance"),
+                "thesis": bull.get("thesis"),
+                "key_points": bull.get("key_points") or [],
+                "strongest_factor": bull.get("strongest_factor"),
+                "weakness": bull.get("weakness_in_my_case"),
+                "confidence_in_buy": bull.get("confidence_in_buy"),
+            },
+            "bear": {
+                "stance": bear.get("stance"),
+                "thesis": bear.get("thesis"),
+                "rebuttals": bear.get("rebuttals") or [],
+                "key_points": bear.get("key_points") or [],
+                "strongest_factor": bear.get("strongest_factor"),
+                "weakness": bear.get("weakness_in_my_case"),
+                "confidence_in_sell": bear.get("confidence_in_sell"),
+            },
+        }
     else:
         if not EMERGENT_LLM_KEY:
             raise HTTPException(status_code=500, detail="LLM key not configured")
@@ -1158,6 +1385,7 @@ async def get_ai_signal(
         sl_method=parsed.get('sl_method'),
         auto_upgraded=auto_upgraded,
         news_blackout=blackout_payload,
+        council_debate=council_debate,
     )
 
     await db.ai_signals.insert_one(signal.model_dump())
